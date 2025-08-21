@@ -489,6 +489,9 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
             instance_name = instance_config.get("instance", "github.com")
             for org in instance_config.get("org", []):
                 org_contexts.add((instance_name, org))
+            for repo in instance_config.get("repo_level", []):
+                org = repo.split("/")[0]
+                org_contexts.add((instance_name, org))
         
         # Pre-calculate bookmark dates per org context
         org_bookmarks = {}
@@ -536,6 +539,25 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
                         })
                     else:
                         self.logger.debug(f"Filtered out partition org={org} month={month}")
+                
+                # Process repo-level searches
+                for repo in instance_config.get("repo_level", []):
+                    org = repo.split("/")[0]
+                    bookmark_date = org_bookmarks.get((instance_name, org))
+                    if self._should_include_month(month, bookmark_date):
+                        query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
+                        partitions.append({
+                            "search_name": f"{repo.replace('/', '_')}_{stream_name}_{month}",
+                            "search_query": query,
+                            "source": instance_name,
+                            "api_url_base": api_url_base,
+                            "org": org,
+                            "month": month,
+                            "kind": self.stream_type,
+                            "repo_breakdown": False
+                        })
+                    else:
+                        self.logger.debug(f"Filtered out partition repo={repo} month={month}")
 
         self.logger.info(f"Generated {len(partitions)} partitions after incremental filtering")
         return partitions
