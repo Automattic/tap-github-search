@@ -74,112 +74,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         """Prepare GraphQL request - actual requests made in get_records()."""
         return {"query": self.query, "variables": {"q": "", "after": None}}
 
-    @property
-    def partitions(self) -> list[dict]:
-        """Generate filtered partitions using incremental state and last complete month logic."""
-        cfg = self.config
-        
-        # Get months to process (backfill or sliding window)
-        months = self._get_months_to_process()
-        if not months:
-            return []
 
-        partitions = []
-        
-        # Get search_scope configuration
-        search_scope = cfg.get("search_scope", {})
-        
-        # Determine which stream config to use based on stream type
-        if self.stream_type == "issue":
-            stream_config = search_scope.get("issue_streams", {})
-        elif self.stream_type == "bug":
-            stream_config = search_scope.get("issue_streams", {})
-        elif self.stream_type == "pr":
-            stream_config = search_scope.get("pr_streams", {})
-        else:
-            # Fallback for other types
-            stream_config = search_scope.get("issue_streams", {})
-        
-        # Get instances from stream config
-        stream_instances = stream_config.get("instances", [])
-        
-        # Collect unique org contexts for state lookup
-        org_contexts = set()
-        for instance_config in stream_instances:
-            instance_name = instance_config.get("instance", "github.com")
-            for org in instance_config.get("org", []):
-                org_contexts.add((instance_name, org))
-            for repo in instance_config.get("repo_level", []):
-                org = repo.split("/")[0]
-                org_contexts.add((instance_name, org))
-        
-        # Pre-calculate bookmark dates per org context
-        org_bookmarks = {}
-        for instance_name, org in org_contexts:
-            context = {"source": instance_name, "org": org}
-            bookmark_str = self._get_bookmark_for_context(context)
-            
-            if bookmark_str:
-                bookmark_date = self._month_to_date(bookmark_str)
-                org_bookmarks[instance_name, org] = bookmark_date
-                self.logger.debug(f"Org {org} bookmark={bookmark_str}")
-            else:
-                org_bookmarks[instance_name, org] = None
-                self.logger.debug(f"Org {org} has no bookmark, will process all months")
-        
-        for month in months:
-            year, month_num = map(int, month.split("-"))
-            start_date = f"{year:04d}-{month_num:02d}-01"
-            last_day = calendar.monthrange(year, month_num)[1]
-            end_date = f"{year:04d}-{month_num:02d}-{last_day:02d}"
-
-            for instance_config in stream_instances:
-                instance_name = instance_config.get("instance", "github.com")
-                api_url_base = instance_config.get("api_url_base", "https://api.github.com")
-                repo_breakdown = instance_config.get("repo_breakdown", False)
-                
-                # Process org-level searches
-                for org in instance_config.get("org", []):
-                    # Check if this month should be included
-                    bookmark_date = org_bookmarks.get((instance_name, org))
-                    if self._should_include_month(month, bookmark_date):
-                        query = self._build_search_query(org, start_date, end_date, self.stream_type)
-                        partitions.append({
-                            "search_name": f"{org}_{self.stream_type}_{month}",
-                            "search_query": query,
-                            "source": instance_name,
-                            "api_url_base": api_url_base,
-                            "org": org,
-                            "month": month,
-                            "kind": self.stream_type,
-                            "repo_breakdown": repo_breakdown
-                        })
-                    else:
-                        self.logger.debug(f"Filtered out partition org={org} month={month}")
-                
-                # Process repo-level searches
-                for repo in instance_config.get("repo_level", []):
-                    org = repo.split("/")[0]
-                    
-                    # Check if this month should be included  
-                    bookmark_date = org_bookmarks.get((instance_name, org))
-                    if self._should_include_month(month, bookmark_date):
-                        query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
-                        partitions.append({
-                            "search_name": f"{repo.replace('/', '_')}_{self.stream_type}_{month}",
-                            "search_query": query,
-                            "source": instance_name,
-                            "api_url_base": api_url_base,
-                            "org": org,
-                            "month": month,
-                            "kind": self.stream_type,
-                            "repo_breakdown": False  # Individual repos don't need breakdown
-                        })
-                    else:
-                        self.logger.debug(f"Filtered out partition repo={repo} month={month}")
-
-        self.logger.info(f"Generated {len(partitions)} partitions after incremental filtering")
-        return partitions
 
     def _get_months_to_process(self) -> list[str]:
         """Get months to process based on backfill configuration."""
@@ -495,6 +390,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         
         # Collect unique org contexts for state lookup
         org_contexts = set()
+        repo_contexts = set()
         for instance_config in instances:
             instance_name = instance_config.get("instance", "github.com")
             for org in instance_config.get("org", []):
@@ -502,6 +398,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
             for repo in instance_config.get("repo_level", []):
                 org = repo.split("/")[0]
                 org_contexts.add((instance_name, org))
+                repo_contexts.add((instance_name, repo))  # Add repo-level context
         
         # Pre-calculate bookmark dates per org context
         org_bookmarks = {}
@@ -516,6 +413,20 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
             else:
                 org_bookmarks[instance_name, org] = None
                 self.logger.debug(f"Org {org} has no bookmark, will process all months")
+        
+        # Pre-calculate bookmark dates per repo context
+        repo_bookmarks = {}
+        for instance_name, repo in repo_contexts:
+            context = {"source": instance_name, "org": repo}  # Use repo as org for repo-level context
+            bookmark_str = self._get_bookmark_for_context(context)
+            
+            if bookmark_str:
+                bookmark_date = self._month_to_date(bookmark_str)
+                repo_bookmarks[instance_name, repo] = bookmark_date
+                self.logger.debug(f"Repo {repo} bookmark={bookmark_str}")
+            else:
+                repo_bookmarks[instance_name, repo] = None
+                self.logger.debug(f"Repo {repo} has no bookmark, will process all months")
         
         for month in months:
             year, month_num = map(int, month.split("-"))
@@ -553,7 +464,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
                 # Process repo-level searches
                 for repo in instance_config.get("repo_level", []):
                     org = repo.split("/")[0]
-                    bookmark_date = org_bookmarks.get((instance_name, org))
+                    bookmark_date = repo_bookmarks.get((instance_name, repo))  # Use repo bookmarks instead of org bookmarks
                     if self._should_include_month(month, bookmark_date):
                         query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
                         partitions.append({
