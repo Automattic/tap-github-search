@@ -336,12 +336,22 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             else:
                 # Get aggregate count
                 total_count = self._search_aggregate_count(query, api_url_base)
+                
+                # For repo-level searches, extract the repo name from the query
+                repo_name = "aggregate"
+                if query.startswith("repo:"):
+                    # This is a repo-level search, extract repo name from query
+                    # Query format: "repo:WordPress/Gutenberg type:pr is:merged created:2025-01-01..2025-01-31"
+                    repo_part = query.split(" ")[0]  # "repo:WordPress/Gutenberg"
+                    if "/" in repo_part:
+                        repo_name = repo_part.split("/")[-1].lower()  # "gutenberg"
+                
                 yield {
                     "search_name": partition["search_name"],
                     "search_query": query,
                     "source": partition["source"],
                     "org": org,
-                    "repo": "aggregate",
+                    "repo": repo_name,
                     "month": month,
                     self.count_field: total_count,
                     "updated_at": now,
