@@ -210,7 +210,6 @@ class TapGitHub(Tap):
             default=False,
             description="Enforce maximum partition limit (disabled by default for performance)",
         ),
-
         th.Property(
             "max_concurrent_requests",
             th.IntegerType,
