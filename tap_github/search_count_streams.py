@@ -167,8 +167,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         
         # Only include months after bookmark
         return month_date > bookmark_date
-    
-    
 
     def _build_search_query(self, org: str, start_date: str, end_date: str, kind: str) -> str:
         """Build GitHub search query for an organization."""
