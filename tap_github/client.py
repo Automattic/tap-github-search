@@ -15,7 +15,7 @@ from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.jsonpath import extract_jsonpath
 from singer_sdk.streams import GraphQLStream, RESTStream
 
-from tap_github.authenticator import GitHubTokenAuthenticator, MultiInstanceGitHubAuthenticator
+from tap_github.authenticator import GitHubTokenAuthenticator
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -45,16 +45,12 @@ class GitHubRestStream(RESTStream):
     # Set to True to use cursor-based pagination instead of page-based pagination
     use_cursor_pagination = False
 
-    _authenticator: GitHubTokenAuthenticator | MultiInstanceGitHubAuthenticator | None = None
+    _authenticator: GitHubTokenAuthenticator | None = None
 
     @property
-    def authenticator(self) -> GitHubTokenAuthenticator | MultiInstanceGitHubAuthenticator:
+    def authenticator(self) -> GitHubTokenAuthenticator:
         if self._authenticator is None:
-            # Use multi-instance authenticator if search_scope is configured
-            if self.config.get("search_scope", {}).get("instances"):
-                self._authenticator = MultiInstanceGitHubAuthenticator(stream=self)
-            else:
-                self._authenticator = GitHubTokenAuthenticator(stream=self)
+            self._authenticator = GitHubTokenAuthenticator(stream=self)
         return self._authenticator
 
     @property

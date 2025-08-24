@@ -12,56 +12,61 @@ from singer_sdk import typing as th
 from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
+from tap_github.authenticator import GitHubTokenAuthenticator
 
 
 class SearchCountStreamBase(GitHubGraphqlStream):
-    """Base class for GitHub search count streams using simplified configuration."""
+    """Base class for configurable GitHub search count streams.
+
+    Emits monthly counts per org or per repo using GraphQL search.
+    Configuration is provided under the single `search` namespace.
+    """
 
     # Configure in subclasses
-    stream_type: ClassVar[str] = "issue"  # "issue" | "pr" | "bug"
-    count_field: ClassVar[str] = "issue_count"
+    stream_type: ClassVar[str] = "custom"
 
-    primary_keys: ClassVar[list[str]] = ["search_name", "month", "source", "org", "repo"]
+    primary_keys: ClassVar[list[str]] = ["search", "month", "org", "repo"]
     replication_method = "INCREMENTAL"
     replication_key = "month"
-    state_partitioning_keys: ClassVar[list[str]] = ["source", "org"]  # Removed month for proper incremental
+    state_partitioning_keys: ClassVar[list[str]] = ["org", "repo"]
 
     def __init__(self, tap, name=None, schema=None, path=None):
-        """Initialize stream with schema."""
-        # Store tap reference for state access
+        """Initialize stream with the provided or default schema."""
         self.tap = tap
-        
         super().__init__(
             tap=tap,
             name=name or self.name,
             schema=schema or self.get_schema(),
-            path=path
+            path=path,
         )
+
+    _authenticator: GitHubTokenAuthenticator | None = None
 
     @classmethod
     def get_schema(cls) -> dict:
-        """Return schema for search count streams."""
+        """Return the JSON schema for emitted records."""
         return th.PropertiesList(
-            th.Property("search_name", th.StringType, required=True),
-            th.Property("search_query", th.StringType, required=True),
-            th.Property("source", th.StringType, required=True),
+            th.Property("search", th.StringType, required=True),
+            th.Property("query", th.StringType, required=True),
             th.Property("org", th.StringType, required=True),
-            th.Property("repo", th.StringType, required=True),  # "aggregate" or repo name
-            th.Property("month", th.StringType, required=True),  # YYYY-MM
-            th.Property(cls.count_field, th.IntegerType, required=True),
+            th.Property("repo", th.StringType, required=True),
+            th.Property("month", th.StringType, required=True),
+            th.Property("count", th.IntegerType, required=True),
             th.Property("updated_at", th.DateTimeType),
         ).to_dict()
 
-
     @property
     def query(self) -> str:
-        """GraphQL query for search with repo breakdown support."""
+        """GraphQL query returning issueCount and repository nodes.
+
+        Pagination is handled via `after`/`endCursor` when needed by helpers.
+        """
         return """
         query SearchWithRepos($q: String!, $after: String) {
           search(query: $q, type: ISSUE, first: 100, after: $after) {
             issueCount
             pageInfo { hasNextPage endCursor }
-            nodes { 
+            nodes {
               ... on Issue { repository { name } }
               ... on PullRequest { repository { name } }
             }
@@ -71,40 +76,32 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         """
 
     def prepare_request_payload(self, context: Mapping[str, Any] | None, next_page_token: Any | None) -> dict:
-        """Prepare GraphQL request - actual requests made in get_records()."""
+        """Build a minimal GraphQL request payload.
+
+        Actual query string is passed via partition context.
+        """
         return {"query": self.query, "variables": {"q": "", "after": None}}
 
-
-
     def _get_months_to_process(self) -> list[str]:
-        """Get months to process based on backfill configuration."""
-        cfg = self.config
-        
-        # Check for backfill configuration
-        if cfg.get("backfill_start_month"):
-            start = cfg["backfill_start_month"]
-            end = cfg.get("backfill_end_month") or self._get_last_complete_month()
-            
-            self.logger.info(f"Backfill config - start: {start}, end: {end}")
-            
-            # Get all months in range - incremental filtering handled at partition level
+        """Compute months to process from `search.backfill`.
+
+        Returns an ordered inclusive list of YYYY-MM.
+        """
+        s = self.config.get("search", {})
+        backfill = s.get("backfill", {})
+        start = backfill.get("start_month")
+        if start:
+            end = backfill.get("end_month") or self._get_last_complete_month()
             all_months = self._get_month_range(start, end)
-            
-            self.logger.info(f"Processing {len(all_months)} months in backfill: {all_months}")
             return all_months
-        
-        # No backfill config, return empty list
         self.logger.info("No backfill configuration found, skipping processing")
         return []
 
-
-
     def _get_month_range(self, start_month: str, end_month: str) -> list[str]:
-        """Generate list of months between start and end (inclusive)."""
+        """Generate inclusive YYYY-MM list between start and end months."""
         months = []
         start = datetime.strptime(f"{start_month}-01", "%Y-%m-%d")
         end = datetime.strptime(f"{end_month}-01", "%Y-%m-%d")
-        
         current = start
         while current <= end:
             months.append(f"{current.year}-{current.month:02d}")
@@ -112,371 +109,261 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 current = current.replace(year=current.year + 1, month=1)
             else:
                 current = current.replace(month=current.month + 1)
-        
         return months
 
     def _get_last_complete_month(self) -> str:
-        """Get the last complete month as YYYY-MM string (always exclude current month)."""
+        """Return the last complete month (YYYY-MM), excluding current month."""
         today = date.today()
         if today.month == 1:
             return f"{today.year - 1}-12"
-        else:
-            return f"{today.year}-{today.month - 1:02d}"
-    
+        return f"{today.year}-{today.month - 1:02d}"
+
     def _get_last_complete_month_date(self) -> date:
-        """Get the last complete month as a date object (always exclude current month)."""
+        """Return the first day of the last complete month as a date."""
         today = date.today()
         if today.month == 1:
             return date(today.year - 1, 12, 1)
-        else:
-            return date(today.year, today.month - 1, 1)
-    
+        return date(today.year, today.month - 1, 1)
+
     def _month_to_date(self, month_str: str) -> date:
-        """Convert YYYY-MM string to date object (first day of month)."""
+        """Convert YYYY-MM to a date on the first of that month."""
         year, month = map(int, month_str.split("-"))
         return date(year, month, 1)
-    
+
     def _get_bookmark_for_context(self, context: dict) -> str | None:
-        """Get bookmark for a specific context from tap state."""
+        """Read the saved bookmark (month) for a given partition context."""
         try:
             stream_state = self.tap.state.get("bookmarks", {}).get(self.name, {})
             partitions_state = stream_state.get("partitions", [])
-            
             for partition_state in partitions_state:
                 state_context = partition_state.get("context", {})
-                if (state_context.get("source") == context["source"] and 
-                    state_context.get("org") == context["org"]):
+                if state_context.get("org") == context.get("org") and state_context.get("repo") == context.get("repo"):
                     return partition_state.get("replication_key_value")
-            
             return None
         except Exception:
             return None
-    
+
     def _should_include_month(self, month_str: str, bookmark_date: date | None) -> bool:
-        """Simple logic: include months after bookmark up to last complete month."""
+        """Return True if the month is after bookmark and not in the future."""
         month_date = self._month_to_date(month_str)
         last_complete = self._get_last_complete_month_date()
-        
-        # Never process future or current months
         if month_date > last_complete:
             return False
-        
-        # If no bookmark, include everything up to last complete
         if bookmark_date is None:
             return True
-        
-        # Only include months after bookmark
         return month_date > bookmark_date
 
     def _build_search_query(self, org: str, start_date: str, end_date: str, kind: str) -> str:
-        """Build GitHub search query for an organization."""
+        """Build the GitHub search query for an org aggregate."""
         base_query = f"org:{org}"
-        
         if kind == "bug":
             base_query += ' is:issue is:open label:bug,"[type] bug","type: bug"'
         elif kind == "pr":
             base_query += " type:pr is:merged"
-        else:  # issue
+        else:
             base_query += " type:issue is:open"
-        
         base_query += f" created:{start_date}..{end_date}"
         return base_query
 
     def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, kind: str) -> str:
-        """Build GitHub search query for a specific repository."""
+        """Build the GitHub search query for a specific repository."""
         base_query = f"repo:{repo}"
-        
         if kind == "bug":
             base_query += ' is:issue is:open label:bug,"[type] bug","type: bug"'
         elif kind == "pr":
             base_query += " type:pr is:merged"
-        else:  # issue
+        else:
             base_query += " type:issue is:open"
-        
         base_query += f" created:{start_date}..{end_date}"
         return base_query
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        """Get search count records for each partition."""
+        """Yield records for either org aggregate or per-repo breakdown."""
         now = datetime.utcnow().isoformat() + "Z"
-        
         partitions_to_process = [context] if context else self.partitions
-        
         for partition in partitions_to_process:
             org = partition["org"]
             month = partition["month"]
             query = partition["search_query"]
             api_url_base = partition["api_url_base"]
             repo_breakdown = partition.get("repo_breakdown", False)
-            
-            self.logger.info(f"Processing partition: {org}/{month}")
-            
-            # Get search results
+            search_name = partition["search_name"]
+
             if repo_breakdown:
-                # Get per-repo counts
                 repo_counts = self._search_with_repo_breakdown(query, api_url_base)
                 for repo, count in repo_counts.items():
                     yield {
-                        "search_name": f"{org}_{repo}_{partition['kind']}_{month}",
-                        "search_query": query,
-                        "source": partition["source"],
+                        "search": search_name,
+                        "query": query,
                         "org": org,
                         "repo": repo,
                         "month": month,
-                        self.count_field: count,
+                        "count": count,
                         "updated_at": now,
                     }
             else:
-                # Get aggregate count
                 total_count = self._search_aggregate_count(query, api_url_base)
-                
-                # For repo-level searches, extract the repo name from the query
                 repo_name = "aggregate"
                 if query.startswith("repo:"):
-                    # This is a repo-level search, extract repo name from query
-                    # Query format: "repo:WordPress/Gutenberg type:pr is:merged created:2025-01-01..2025-01-31"
-                    repo_part = query.split(" ")[0]  # "repo:WordPress/Gutenberg"
+                    repo_part = query.split(" ")[0]
                     if "/" in repo_part:
-                        repo_name = repo_part.split("/")[-1].lower()  # "gutenberg"
-                
+                        repo_name = repo_part.split("/")[-1].lower()
                 yield {
-                    "search_name": partition["search_name"],
-                    "search_query": query,
-                    "source": partition["source"],
+                    "search": search_name,
+                    "query": query,
                     "org": org,
                     "repo": repo_name,
                     "month": month,
-                    self.count_field: total_count,
+                    "count": total_count,
                     "updated_at": now,
                 }
 
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
-        """Search and return counts broken down by repository."""
-        # Check if we need to slice the month due to large result sets
+        """Return repo->count map, slicing by week if needed to avoid 1000+ cap."""
         total_count = self._search_aggregate_count(query, api_url_base)
-        
         if total_count <= 1000:
-            # Small enough to get all results at once
             return self._get_repo_counts_from_nodes(query, api_url_base)
-        else:
-            # Auto-slice into smaller date ranges
-            return self._search_with_auto_slicing(query, api_url_base)
+        return self._search_with_auto_slicing(query, api_url_base)
 
     def _search_aggregate_count(self, query: str, api_url_base: str) -> int:
-        """Get total search count without pagination."""
+        """Return total search count (issueCount) for the query."""
         payload = {"query": self.query, "variables": {"q": query, "after": None}}
-        prepared_request = self.build_prepared_request(
-            method="POST",
-            url=f"{api_url_base}/graphql", 
-            json=payload
-        )
+        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
         response = self._request(prepared_request, None)
         response_json = response.json()
         return response_json["data"]["search"]["issueCount"]
 
     def _get_repo_counts_from_nodes(self, query: str, api_url_base: str) -> dict[str, int]:
-        """Get repository counts by paginating through search nodes."""
+        """Iterate search nodes and tally counts per repository."""
         repo_counts = defaultdict(int)
         after = None
-        
         while True:
             payload = {"query": self.query, "variables": {"q": query, "after": after}}
-            prepared_request = self.build_prepared_request(
-                method="POST",
-                url=f"{api_url_base}/graphql", 
-                json=payload
-            )
+            prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
             response = self._request(prepared_request, None)
             response_json = response.json()
             search = response_json["data"]["search"]
-            
-            # Count by repository
             for node in search["nodes"]:
                 repo_name = node["repository"]["name"]
                 repo_counts[repo_name] += 1
-            
             if not search["pageInfo"]["hasNextPage"]:
                 break
             after = search["pageInfo"]["endCursor"]
-        
         return dict(repo_counts)
 
     def _search_with_auto_slicing(self, query: str, api_url_base: str) -> dict[str, int]:
-        """Auto-slice large queries into weekly chunks to stay under 1000 result limit."""
-        # Extract date range from query
+        """Slice the month into 7-day windows and aggregate repo counts across slices."""
         date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
         if not date_match:
-            # Fallback to regular pagination if can't parse dates
             return self._get_repo_counts_from_nodes(query, api_url_base)
-        
         start_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
         end_date = datetime.strptime(date_match.group(2), "%Y-%m-%d")
-        
         repo_counts = defaultdict(int)
         current = start_date
-        
-        # Process in 7-day slices
         while current <= end_date:
             slice_end = min(current + timedelta(days=6), end_date)
             slice_query = re.sub(
                 r"created:\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}",
                 f"created:{current.strftime('%Y-%m-%d')}..{slice_end.strftime('%Y-%m-%d')}",
-                query
+                query,
             )
-            
             slice_counts = self._get_repo_counts_from_nodes(slice_query, api_url_base)
             for repo, count in slice_counts.items():
                 repo_counts[repo] += count
-            
             current = slice_end + timedelta(days=1)
-        
         return dict(repo_counts)
 
 
 class ConfigurableSearchCountStream(SearchCountStreamBase):
-    
+    """Concrete stream created from a `search.streams` definition."""
     def __init__(self, stream_config: dict, tap):
         self.stream_config = stream_config
         self.query_template = stream_config["query_template"]
-        self.count_field_name = stream_config["count_field"]
         self.stream_description = stream_config.get("description", f"Search stream: {stream_config['name']}")
-        
         self.name = f"{stream_config['name']}_search_counts"
-        self.stream_type = stream_config.get("stream_type", "custom")
-        self.count_field = self.count_field_name
-        
-        # Store tap reference for state access
+        self.stream_type = stream_config.get("stream_type", stream_config.get("name", "custom"))
         self.tap = tap
-        
-        super().__init__(
-            tap=tap,
-            name=self.name,
-            schema=self.get_configurable_schema(),
-        )
-    
+        super().__init__(tap=tap, name=self.name, schema=self.get_configurable_schema())
+
     def get_configurable_schema(self) -> dict:
+        """Return the JSON schema for this configured search stream."""
         return th.PropertiesList(
-            th.Property("search_name", th.StringType, required=True),
-            th.Property("search_query", th.StringType, required=True),
-            th.Property("source", th.StringType, required=True),
+            th.Property("search", th.StringType, required=True),
+            th.Property("query", th.StringType, required=True),
             th.Property("org", th.StringType, required=True),
             th.Property("repo", th.StringType, required=True),
             th.Property("month", th.StringType, required=True),
-            th.Property(self.count_field_name, th.IntegerType, required=True),
+            th.Property("count", th.IntegerType, required=True),
             th.Property("updated_at", th.DateTimeType),
         ).to_dict()
-    
+
     def _build_search_query(self, org: str, start_date: str, end_date: str, stream_type: str) -> str:
-        return self.query_template.format(
-            org=org,
-            start=start_date,
-            end=end_date
-        )
+        return self.query_template.format(org=org, start=start_date, end=end_date)
 
     @property
     def partitions(self) -> list[Context]:
-        search_scope = self.config.get("search_scope", {})
-        instances = search_scope.get("instances", [])
-        
-        if not instances:
-            self.logger.warning(f"No instances found in search_scope for {self.name}")
+        """Create partitions across months and orgs/repos for this stream."""
+        s = self.config.get("search", {})
+        scope = s.get("scope", {})
+        orgs = scope.get("orgs", [])
+        repos = scope.get("repos", [])
+        api_url_base = scope.get("api_url_base", "https://api.github.com")
+        breakdown = scope.get("breakdown", "none") == "repo"
+        if not orgs and not repos:
+            self.logger.warning(f"No orgs or repos provided for {self.name}")
             return []
 
-        partitions = []
+        partitions: list[Context] = []
         months = self._get_months_to_process()
-        stream_name = self.stream_config['name']
-        
-        # Collect unique org contexts for state lookup
-        org_contexts = set()
-        repo_contexts = set()
-        for instance_config in instances:
-            instance_name = instance_config.get("instance", "github.com")
-            for org in instance_config.get("org", []):
-                org_contexts.add((instance_name, org))
-            for repo in instance_config.get("repo_level", []):
-                org = repo.split("/")[0]
-                org_contexts.add((instance_name, org))
-                repo_contexts.add((instance_name, repo))  # Add repo-level context
-        
-        # Pre-calculate bookmark dates per org context
-        org_bookmarks = {}
-        for instance_name, org in org_contexts:
-            context = {"source": instance_name, "org": org}
-            bookmark_str = self._get_bookmark_for_context(context)
-            
-            if bookmark_str:
-                bookmark_date = self._month_to_date(bookmark_str)
-                org_bookmarks[instance_name, org] = bookmark_date
-                self.logger.debug(f"Org {org} bookmark={bookmark_str}")
-            else:
-                org_bookmarks[instance_name, org] = None
-                self.logger.debug(f"Org {org} has no bookmark, will process all months")
-        
-        # Pre-calculate bookmark dates per repo context
-        repo_bookmarks = {}
-        for instance_name, repo in repo_contexts:
-            context = {"source": instance_name, "org": repo}  # Use repo as org for repo-level context
-            bookmark_str = self._get_bookmark_for_context(context)
-            
-            if bookmark_str:
-                bookmark_date = self._month_to_date(bookmark_str)
-                repo_bookmarks[instance_name, repo] = bookmark_date
-                self.logger.debug(f"Repo {repo} bookmark={bookmark_str}")
-            else:
-                repo_bookmarks[instance_name, repo] = None
-                self.logger.debug(f"Repo {repo} has no bookmark, will process all months")
-        
+        stream_name = self.stream_config["name"]
+
+        # Pre-calc bookmarks
+        org_bookmarks: dict[tuple[str, str], date | None] = {}
+        for org in orgs:
+            bookmark_str = self._get_bookmark_for_context({"org": org})
+            org_bookmarks[("single", org)] = self._month_to_date(bookmark_str) if bookmark_str else None
+
+        repo_bookmarks: dict[tuple[str, str], date | None] = {}
+        for repo in repos:
+            bookmark_str = self._get_bookmark_for_context({"org": repo, "repo": repo})
+            repo_bookmarks[("single", repo)] = self._month_to_date(bookmark_str) if bookmark_str else None
+
         for month in months:
             year, month_num = map(int, month.split("-"))
             start_date = f"{year:04d}-{month_num:02d}-01"
             last_day = calendar.monthrange(year, month_num)[1]
             end_date = f"{year:04d}-{month_num:02d}-{last_day:02d}"
 
-            for instance_config in instances:
-                supported_streams = instance_config.get("streams", [])
-                if supported_streams and stream_name not in supported_streams:
-                    continue
-                    
-                instance_name = instance_config.get("instance", "github.com")
-                api_url_base = instance_config.get("api_url_base", "https://api.github.com")
-                repo_breakdown = instance_config.get("repo_breakdown", False)
-                
-                for org in instance_config.get("org", []):
-                    # Check if this month should be included
-                    bookmark_date = org_bookmarks.get((instance_name, org))
-                    if self._should_include_month(month, bookmark_date):
-                        query = self._build_search_query(org, start_date, end_date, self.stream_type)
-                        partitions.append({
-                            "search_name": f"{org}_{stream_name}_{month}",
-                            "search_query": query,
-                            "source": instance_name,
-                            "api_url_base": api_url_base,
-                            "org": org,
-                            "month": month,
-                            "kind": self.stream_type,
-                            "repo_breakdown": repo_breakdown
-                        })
-                    else:
-                        self.logger.debug(f"Filtered out partition org={org} month={month}")
-                
-                # Process repo-level searches
-                for repo in instance_config.get("repo_level", []):
-                    org = repo.split("/")[0]
-                    bookmark_date = repo_bookmarks.get((instance_name, repo))  # Use repo bookmarks instead of org bookmarks
-                    if self._should_include_month(month, bookmark_date):
-                        query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
-                        partitions.append({
-                            "search_name": f"{repo.replace('/', '_')}_{stream_name}_{month}",
-                            "search_query": query,
-                            "source": instance_name,
-                            "api_url_base": api_url_base,
-                            "org": org,
-                            "month": month,
-                            "kind": self.stream_type,
-                            "repo_breakdown": False
-                        })
-                    else:
-                        self.logger.debug(f"Filtered out partition repo={repo} month={month}")
+            # org-level aggregate
+            for org in orgs:
+                bookmark_date = org_bookmarks.get(("single", org))
+                if self._should_include_month(month, bookmark_date):
+                    query = self._build_search_query(org, start_date, end_date, self.stream_type)
+                    partitions.append({
+                        "search_name": stream_name,
+                        "search_query": query,
+                        "api_url_base": api_url_base,
+                        "org": org,
+                        "month": month,
+                        "kind": stream_name,
+                        "repo_breakdown": breakdown,
+                    })
+
+            # repo-level
+            for repo in repos:
+                org = repo.split("/")[0]
+                bookmark_date = repo_bookmarks.get(("single", repo))
+                if self._should_include_month(month, bookmark_date):
+                    query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
+                    partitions.append({
+                        "search_name": stream_name,
+                        "search_query": query,
+                        "api_url_base": api_url_base,
+                        "org": org,
+                        "month": month,
+                        "kind": stream_name,
+                        "repo_breakdown": False,
+                    })
 
         self.logger.info(f"Generated {len(partitions)} partitions after incremental filtering")
         return partitions
@@ -484,51 +371,39 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
 
 def validate_stream_config(stream_config: dict) -> list[str]:
     errors = []
-    
-    required_fields = ["name", "query_template", "count_field"]
+    required_fields = ["name", "query_template"]
     for field in required_fields:
         if not stream_config.get(field):
             errors.append(f"Missing required field: {field}")
-    
     name = stream_config.get("name", "")
     if name and not name.replace("_", "").replace("-", "").isalnum():
         errors.append(f"Stream name '{name}' must contain only alphanumeric characters, underscores, and hyphens")
-    
     query_template = stream_config.get("query_template", "")
-    required_placeholders = ["{org}", "{start}", "{end}"]
-    for placeholder in required_placeholders:
+    for placeholder in ["{org}", "{start}", "{end}"]:
         if placeholder not in query_template:
             errors.append(f"Query template must contain {placeholder} placeholder")
-    
-    count_field = stream_config.get("count_field", "")
-    if count_field and not count_field.replace("_", "").isalnum():
-        errors.append(f"Count field '{count_field}' must contain only alphanumeric characters and underscores")
-    
     return errors
 
 
 def create_configurable_streams(tap) -> list:
-    streams = []
-    
-    # Handle search_streams configuration (new format)
-    stream_definitions = tap.config.get("search_streams", [])
-    
-    if stream_definitions:
-        for stream_config in stream_definitions:
-            errors = validate_stream_config(stream_config)
+    streams: list[ConfigurableSearchCountStream] = []
+    config = tap.config
+    if "search" in config:
+        s = config.get("search", {})
+        for sd in s.get("streams", []):
+            sc = {
+                "name": sd.get("name"),
+                "query_template": sd.get("query_template"),
+                "description": sd.get("description"),
+            }
+            errors = validate_stream_config(sc)
             if errors:
-                tap.logger.warning(f"Invalid stream config '{stream_config.get('name', 'unknown')}': {'; '.join(errors)}")
+                tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
-            
-            try:
-                stream = ConfigurableSearchCountStream(stream_config, tap)
-                streams.append(stream)
-                tap.logger.info(f"Created search stream: {stream.name}")
-            except Exception as e:
-                tap.logger.warning(f"Failed to create stream '{stream_config.get('name', 'unknown')}': {e}")
-    
+            streams.append(ConfigurableSearchCountStream(sc, tap))
+    else:
+        tap.logger.warning("No search configuration found")
     if not streams:
         tap.logger.warning("No search streams created from configuration")
-    
     return streams
 

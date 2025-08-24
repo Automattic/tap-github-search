@@ -64,8 +64,7 @@ class TapGitHub(Tap):
         th.Property(
             "rate_limit_buffer",
             th.IntegerType,
-            default=200,
-            description="Add a buffer to avoid consuming all query points for the token at hand. Defaults to 200 for aggressive performance.",  # noqa: E501
+            description="Add a buffer to avoid consuming all query points for the token at hand. Defaults to 1000.",  # noqa: E501
         ),
         th.Property(
             "expiry_time_buffer",
@@ -135,94 +134,49 @@ class TapGitHub(Tap):
         ),
 
         th.Property(
-            "search_streams",
-            th.ArrayType(
-                th.ObjectType(
-                    th.Property("name", th.StringType, required=True),
-                    th.Property("query_template", th.StringType, required=True),
-                    th.Property("count_field", th.StringType, required=True),
-                    th.Property("description", th.StringType),
-                )
-            ),
-            description=(
-                "Array of search stream definitions:\n"
-                '"name" - unique stream name (will be suffixed with _search_counts)\n'
-                '"query_template" - GitHub search query with placeholders {org}, {start}, {end}\n'
-                '"count_field" - name of the count field in output (e.g., issue_count)\n'
-                '"description" - optional description for the stream'
-            ),
-        ),
-        th.Property(
-            "search_scope",
+            "search",
             th.ObjectType(
                 th.Property(
-                    "instances",
+                    "streams",
                     th.ArrayType(
                         th.ObjectType(
-                            th.Property("instance", th.StringType, required=True),
-                            th.Property("api_url_base", th.StringType, required=True),
-                            th.Property("auth_token", th.StringType),
-                            th.Property(
-                                "streams",
-                                th.ArrayType(th.StringType),
-                                description="List of stream names this instance supports",
-                            ),
-                            th.Property(
-                                "org",
-                                th.ArrayType(th.StringType),
-                                description="Organizations for org-level aggregated queries",
-                            ),
-                            th.Property(
-                                "repo_level",
-                                th.ArrayType(th.StringType),
-                                description="List of specific repositories (format: org/repo) for repo-level queries",
-                            ),
-                            th.Property("repo_breakdown", th.BooleanType, default=False),
-                            th.Property("max_partitions", th.IntegerType, default=5000),
-                            th.Property("partition_warning_threshold", th.IntegerType, default=2000),
-                            th.Property("enforce_partition_limit", th.BooleanType, default=False),
+                            th.Property("name", th.StringType, required=True),
+                            th.Property("query_template", th.StringType, required=True),
+                            th.Property("description", th.StringType),
                         )
                     ),
-                    description="List of GitHub instances with their specific org/repo configurations and supported streams",
+                ),
+                th.Property(
+                    "scope",
+                    th.ObjectType(
+                        th.Property("api_url_base", th.StringType),
+                        th.Property("orgs", th.ArrayType(th.StringType)),
+                        th.Property("repos", th.ArrayType(th.StringType)),
+                        th.Property(
+                            "breakdown",
+                            th.StringType,
+                            allowed_values=["none", "repo"],
+                            default="none",
+                        ),
+                    ),
+                ),
+                th.Property(
+                    "backfill",
+                    th.ObjectType(
+                        th.Property("start_month", th.StringType, required=True),
+                        th.Property("end_month", th.StringType),
+                    ),
                 ),
             ),
-            description=(
-                "Search scope configuration for multi-instance GitHub environments:\n"
-                '"instances" - array of GitHub instances with instance->org->repo mapping and stream support'
-            ),
-        ),
-        # Performance and validation configuration for search count streams
-        th.Property(
-            "max_partitions",
-            th.IntegerType,
-            default=5000,
-            description="Maximum number of partitions allowed for search count streams (increased for performance)",
-        ),
-        th.Property(
-            "partition_warning_threshold",
-            th.IntegerType,
-            default=500,
-            description="Partition count threshold for performance warnings",
-        ),
-        th.Property(
-            "enforce_partition_limit",
-            th.BooleanType,
-            default=False,
-            description="Enforce maximum partition limit (disabled by default for performance)",
-        ),
-        th.Property(
-            "max_concurrent_requests",
-            th.IntegerType,
-            default=4,
-            description="Maximum number of concurrent API requests per token",
+            description="Optional search configuration (single instance per run).",
         ),
     ).to_dict()
 
     def discover_streams(self) -> list[Stream]:
         streams = []
         
-        # Use configurable streams for both search_streams and search_scope
-        if self.config and ("search_streams" in self.config or "search_scope" in self.config):
+        # Use configurable streams for search only when 'search' is provided
+        if self.config and ("search" in self.config):
             from tap_github.search_count_streams import create_configurable_streams
             return create_configurable_streams(self)
         
