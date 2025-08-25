@@ -355,6 +355,3 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
     if not streams:
         tap.logger.warning("No search streams created from configuration")
     return streams
-
-
-

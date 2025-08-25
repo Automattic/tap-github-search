@@ -122,5 +122,3 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
             f"and {len(app_token_managers)} app keys."
         )
         return personal_token_managers + app_token_managers
-
-

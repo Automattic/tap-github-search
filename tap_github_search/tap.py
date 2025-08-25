@@ -29,6 +29,3 @@ class TapGitHubSearch(TapGitHub):
 
 
 cli = TapGitHubSearch.cli
-
-
-
