@@ -155,7 +155,9 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 repo_counts = self._search_with_repo_breakdown(query, api_url_base)
                 for repo, count in repo_counts.items():
                     # Keep API calls org-scoped, but emit a repo-scoped query for clarity in output
-                    emitted_query = f"{query} repo:{org}/{repo}"
+                    # Replace any org:{org} token with repo:{org}/{repo} so the query is repo-only.
+                    rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
+                    emitted_query = f"repo:{org}/{repo} {rest_query}".strip()
                     yield {
                         "search": search_name,
                         "query": emitted_query,
