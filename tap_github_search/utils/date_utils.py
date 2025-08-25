@@ -35,6 +35,3 @@ def month_range(start_month: str, end_month: str) -> List[str]:
         else:
             current = current.replace(month=current.month + 1)
     return months
-
-
-
