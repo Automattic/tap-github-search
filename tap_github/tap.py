@@ -132,65 +132,25 @@ class TapGitHub(Tap):
             ),
             description="Options which change the behaviour of a specific stream.",
         ),
-
-        th.Property(
-            "search",
-            th.ObjectType(
-                th.Property(
-                    "streams",
-                    th.ArrayType(
-                        th.ObjectType(
-                            th.Property("name", th.StringType, required=True),
-                            th.Property("query_template", th.StringType, required=True),
-                            th.Property("description", th.StringType),
-                        )
-                    ),
-                ),
-                th.Property(
-                    "scope",
-                    th.ObjectType(
-                        th.Property("api_url_base", th.StringType),
-                        th.Property("orgs", th.ArrayType(th.StringType)),
-                        th.Property("repos", th.ArrayType(th.StringType)),
-                        th.Property(
-                            "breakdown",
-                            th.StringType,
-                            allowed_values=["none", "repo"],
-                            default="none",
-                        ),
-                    ),
-                ),
-                th.Property(
-                    "backfill",
-                    th.ObjectType(
-                        th.Property("start_month", th.StringType, required=True),
-                        th.Property("end_month", th.StringType),
-                    ),
-                ),
-            ),
-            description="Optional search configuration (single instance per run).",
-        ),
     ).to_dict()
 
     def discover_streams(self) -> list[Stream]:
-        streams = []
-        
-        # Use configurable streams for search only when 'search' is provided
-        if self.config and ("search" in self.config):
-            from tap_github.search_count_streams import create_configurable_streams
-            return create_configurable_streams(self)
-        
-        if not self.config:
-            return streams
-            
-        if len(Streams.all_valid_queries().intersection(self.config)) != 1:
+        """Return a list of discovered streams for each query."""
+
+        # If the config is empty, assume we are running --help or --capabilities.
+        if (
+            self.config
+            and len(Streams.all_valid_queries().intersection(self.config)) != 1
+        ):
             raise ValueError(
                 "This tap requires one and only one of the following path options: "
                 f"{Streams.all_valid_queries()}, provided config: {self.config}"
             )
-            
+        streams = []
         for stream_type in Streams:
-            if len(stream_type.valid_queries.intersection(self.config)) > 0:
+            if (not self.config) or len(
+                stream_type.valid_queries.intersection(self.config)
+            ) > 0:
                 streams += [
                     StreamClass(tap=self) for StreamClass in stream_type.streams
                 ]
