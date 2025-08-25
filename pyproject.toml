@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "meltanolabs-tap-github"
+name = "tap-github-search"
 version = "0.0.0"
 description = "Singer tap for GitHub, built with the Singer SDK."
 authors = ["Meltano and Meltano Community <hello@meltano.com>"]
@@ -7,8 +7,8 @@ maintainers = [
 	"Meltano and Meltano Community <hello@meltano.com>",
 	"Edgar Ramírez-Mondragón <edgarrm358@gmail.com>",
 ]
-homepage = "https://github.com/MeltanoLabs/tap-github"
-repository = "https://github.com/MeltanoLabs/tap-github"
+homepage = "https://github.com/Automattic/tap-github-search"
+repository = "https://github.com/Automattic/tap-github-search"
 license = "Apache-2.0"
 keywords = ["Meltano", "Singer", "Meltano SDK", "Singer SDK", "ELT", "GitHub"]
 readme = "README.md"
@@ -25,7 +25,7 @@ classifiers = [
 	"Typing :: Typed",
 ]
 packages = [
-	{ include = "tap_github", format = ["sdist", "wheel"] }
+	{ include = "tap_github_search", format = ["sdist", "wheel"] }
 ]
 
 [tool.poetry.urls]
@@ -42,6 +42,7 @@ requests = "~=2.32.3"
 # For local SDK dev:
 # singer-sdk = {path = "../singer-sdk", develop = true}
 singer-sdk = "~=0.47.2"
+meltanolabs-tap-github = ">=1.20.0"
 
 [tool.poetry.group.dev.dependencies]
 mypy = ">=1.15.0"
@@ -72,7 +73,7 @@ build-backend = "poetry_dynamic_versioning.backend"
 
 [tool.poetry.scripts]
 # CLI declaration
-tap-github = 'tap_github.tap:cli'
+tap-github-search = 'tap_github_search.tap:cli'
 
 [tool.pytest.ini_options]
 markers = [
