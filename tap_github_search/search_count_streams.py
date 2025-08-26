@@ -42,7 +42,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         self.tap = tap
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
-    _authenticator: GitHubTokenAuthenticator | None = None
+    _authenticator: WrapperGitHubTokenAuthenticator | None = None
 
     @classmethod
     def _build_search_schema(cls) -> dict:
@@ -86,8 +86,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             self._authenticator = WrapperGitHubTokenAuthenticator(stream=self)
         return self._authenticator
 
-    def prepare_request_payload(self, context: Mapping[str, Any] | None, next_page_token: Any | None) -> dict:
-        return {"query": self.query, "variables": {"q": "", "after": None}}
 
     def _get_months_to_process(self) -> list[str]:
         cfg_source = getattr(self, "_search_cfg", None) or self.config
@@ -120,25 +118,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return True
         return month_date > bookmark_date
 
-    def _build_search_query(self, org: str, start_date: str, end_date: str, kind: str) -> str:
-        base_query = f"org:{org}"
-        if kind == "bug":
-            base_query += ' is:issue is:open label:bug,"[type] bug","type: bug"'
-        elif kind == "pr":
-            base_query += " type:pr is:merged"
-        else:
-            base_query += " type:issue is:open"
-        return f"{base_query} created:{start_date}..{end_date}"
 
-    def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, kind: str) -> str:
-        base_query = f"repo:{repo}"
-        if kind == "bug":
-            base_query += ' is:issue is:open label:bug,"[type] bug","type: bug"'
-        elif kind == "pr":
-            base_query += " type:pr is:merged"
-        else:
-            base_query += " type:issue is:open"
-        return f"{base_query} created:{start_date}..{end_date}"
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
         now = datetime.utcnow().isoformat() + "Z"
@@ -248,13 +228,15 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         self.name = f"{stream_config['name']}_search_counts"
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "custom"))
         self.tap = tap
-        super().__init__(tap=tap, name=self.name, schema=self.get_configurable_schema())
+        super().__init__(tap=tap, name=self.name, schema=self.get_schema())
 
-    def get_configurable_schema(self) -> dict:
-        return self._build_search_schema()
 
     def _build_search_query(self, org: str, start_date: str, end_date: str, stream_type: str) -> str:
         return self.query_template.format(org=org, start=start_date, end=end_date)
+
+    def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, stream_type: str) -> str:
+        # Replace {org} placeholder with repo: format for repo-specific queries
+        return self.query_template.replace("org:{org}", f"repo:{repo}").format(org=repo.split('/')[0], start=start_date, end=end_date)
 
     @property
     def partitions(self) -> list[Context]:
