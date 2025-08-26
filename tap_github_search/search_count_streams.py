@@ -235,8 +235,8 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         return self.query_template.format(org=org, start=start_date, end=end_date)
 
     def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, stream_type: str) -> str:
-        # Replace {org} placeholder with repo: format for repo-specific queries
-        return self.query_template.replace("org:{org}", f"repo:{repo}").format(org=repo.split('/')[0], start=start_date, end=end_date)
+        # For repo-specific queries, use full repo name in place of {org}
+        return self.query_template.format(org=repo, start=start_date, end=end_date)
 
     @property
     def partitions(self) -> list[Context]:
