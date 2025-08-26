@@ -37,6 +37,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     replication_method: ClassVar[str] = REPLICATION_METHOD
     replication_key: ClassVar[str] = REPLICATION_KEY
     state_partitioning_keys: ClassVar[list[str]] = STATE_KEYS
+    selected_by_default: bool = True  # Enable standard stream selection
 
     def __init__(self, tap, name=None, schema=None, path=None):
         self.tap = tap
