@@ -37,10 +37,11 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     replication_method: ClassVar[str] = REPLICATION_METHOD
     replication_key: ClassVar[str] = REPLICATION_KEY
     state_partitioning_keys: ClassVar[list[str]] = STATE_KEYS
-    selected_by_default: bool = True  # Enable standard stream selection
+    selected_by_default: bool = True
 
     def __init__(self, tap, name=None, schema=None, path=None):
         self.tap = tap
+        self._repo_cache: dict[str, list[str]] = {}
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
     _authenticator: WrapperGitHubTokenAuthenticator | None = None
@@ -166,8 +167,73 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 }
 
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
-        total_count = self._search_aggregate_count(query, api_url_base)
-        return self._compute_repo_counts(query, api_url_base, total_count)
+        """
+        Per-repo breakdown via aggregate counts: one search per repo using issueCount.
+        """
+        # If already repo-scoped, just return that repo's aggregate count.
+        repo_m = re.search(r"\brepo:([^\s/]+)/([^\s]+)", query)
+        if repo_m:
+            repo_name = repo_m.group(2).lower()
+            return {repo_name: self._search_aggregate_count(query, api_url_base)}
+
+        # Expect an org-scoped query; fall back to legacy if not found.
+        org_m = re.search(r"\borg:([^\s]+)", query)
+        if not org_m:
+            total_count = self._search_aggregate_count(query, api_url_base)
+            return self._compute_repo_counts(query, api_url_base, total_count)
+
+        org = org_m.group(1)
+        repos = self._list_repos_for_org(api_url_base, org)
+        rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
+
+        counts: dict[str, int] = {}
+        if not repos:
+            return counts
+        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "20")) or 20
+        repo_names: list[str] = []
+        queries: list[str] = []
+        for name in repos:
+            repo_names.append(name)
+            queries.append(f"repo:{org}/{name} {rest_query}".strip())
+
+        for i in range(0, len(queries), batch_size):
+            q_batch = queries[i : i + batch_size]
+            n_batch = repo_names[i : i + batch_size]
+            batch_counts = self._search_aggregate_count_batch(q_batch, api_url_base)
+            for repo_name, c in zip(n_batch, batch_counts):
+                if c:
+                    counts[repo_name] = c
+        return counts
+
+    def _search_aggregate_count_batch(self, queries: list[str], api_url_base: str) -> list[int]:
+        """
+        Fetch aggregate issueCount for multiple queries in one GraphQL request via aliases.
+        Returns counts in the same order as input queries.
+        """
+        if not queries:
+            return []
+        # Build GraphQL with variables $q0, $q1, ... and aliases a0, a1, ...
+        var_defs = []
+        fields = []
+        variables: dict[str, str] = {}
+        for idx, q in enumerate(queries):
+            var_name = f"q{idx}"
+            alias = f"a{idx}"
+            var_defs.append(f"${var_name}: String!")
+            fields.append(f"{alias}: search(query: ${var_name}, type: ISSUE, first: 1) {{ issueCount }}")
+            variables[var_name] = q
+        var_section = ", ".join(var_defs)
+        field_section = "\n  ".join(fields)
+        doc = f"query RepoCounts({var_section}) {{\n  {field_section}\n}}"
+        payload = {"query": doc, "variables": variables}
+        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+        response = self._request(prepared_request, None)
+        data = response.json().get("data", {})
+        results: list[int] = []
+        for idx in range(len(queries)):
+            alias = f"a{idx}"
+            results.append(int(data.get(alias, {}).get("issueCount", 0)))
+        return results
 
     def _compute_repo_counts(self, query: str, api_url_base: str, total_count: int) -> dict[str, int]:
         if total_count <= 1000:
@@ -205,7 +271,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         start_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
         end_date = datetime.strptime(date_match.group(2), "%Y-%m-%d")
         repo_counts: Counter[str] = Counter()
-        slice_days = int(os.environ.get("GITHUB_SEARCH_SLICE_DAYS", "7")) or 7
+        slice_days = int(os.environ.get("GITHUB_SEARCH_SLICE_DAYS", "5")) or 5
         current = start_date
         while current <= end_date:
             slice_end = min(current + timedelta(days=slice_days - 1), end_date)
@@ -219,6 +285,35 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 repo_counts.update({repo: count})
             current = slice_end + timedelta(days=1)
         return dict(repo_counts)
+
+    def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
+        if org in self._repo_cache:
+            return self._repo_cache[org]
+        q = (
+            """
+        query($org:String!, $after:String){
+          organization(login:$org){
+            repositories(first:100, after:$after){
+              pageInfo { hasNextPage endCursor }
+              nodes { name }
+            }
+          }
+        }
+        """
+        )
+        names: list[str] = []
+        after = None
+        while True:
+            payload = {"query": q, "variables": {"org": org, "after": after}}
+            prepared = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+            resp = self._request(prepared, None)
+            data = resp.json()["data"]["organization"]["repositories"]
+            names.extend([n["name"] for n in data["nodes"]])
+            if not data["pageInfo"]["hasNextPage"]:
+                break
+            after = data["pageInfo"]["endCursor"]
+        self._repo_cache[org] = names
+        return names
 
 
 class ConfigurableSearchCountStream(SearchCountStreamBase):
