@@ -199,6 +199,45 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return dict(repo_counts)
 
     def _search_with_auto_slicing(self, query: str, api_url_base: str) -> dict[str, int]:
+        # NEW: support "open-in-month" pattern by fanning into two created:RANGE buckets
+        # Pattern we emit upstream for "open in MONTH":
+        #   created:<=END  -closed:<START
+        # Equivalent to UNION of:
+        #   A) created:[LOWER_BOUND..START-1] -closed:<START
+        #   B) created:[START..END]           -closed:<START
+        created_le = re.search(r"\bcreated:<=([0-9]{4}-[0-9]{2}-[0-9]{2})\b", query)
+        closed_lt  = re.search(r"-closed:<([0-9]{4}-[0-9]{2}-[0-9]{2})\b", query)
+        if created_le and closed_lt:
+            end_str   = created_le.group(1)   # e.g. 2025-01-31
+            start_str = closed_lt.group(1)    # e.g. 2025-01-01
+            try:
+                start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
+                end_dt   = datetime.strptime(end_str,   "%Y-%m-%d").date()
+            except ValueError:
+                start_dt = None
+                end_dt   = None
+            if start_dt and end_dt and start_dt <= end_dt:
+                lower_bound = os.environ.get("GITHUB_CREATED_LOWER_BOUND", "2008-01-01")
+                day_before_start = (start_dt - timedelta(days=1)).isoformat()
+                # Replace the single 'created:<=END' with a RANGE for each bucket
+                q_preexisting = re.sub(
+                    r"\bcreated:<=\d{4}-\d{2}-\d{2}\b",
+                    f"created:{lower_bound}..{day_before_start}",
+                    query,
+                    count=1,
+                )
+                q_inmonth = re.sub(
+                    r"\bcreated:<=\d{4}-\d{2}-\d{2}\b",
+                    f"created:{start_str}..{end_str}",
+                    query,
+                    count=1,
+                )
+                combined: Counter[str] = Counter()
+                for q_slice in (q_preexisting, q_inmonth):
+                    combined.update(self._search_with_auto_slicing(q_slice, api_url_base))
+                return dict(combined)
+
+        # EXISTING: handle explicit created:RANGE by weekly slicing
         date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
         if not date_match:
             return self._get_repo_counts_from_nodes(query, api_url_base)
