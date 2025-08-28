@@ -313,3 +313,57 @@ def test_no_created_falls_back(monkeypatch):
 
     assert calls["n"] == 1
     assert out == {"rZ": 7}
+
+
+def test_repo_breakdown_batches_issuecount(monkeypatch):
+    """
+    Org-scoped breakdown should call batched aggregate counts and return per-repo mapping.
+    """
+    s = _mk_stream()
+
+    # Force small batch size to exercise batching
+    monkeypatch.setenv("GITHUB_SEARCH_BATCH_SIZE", "2")
+
+    # Provide a fixed repo list
+    monkeypatch.setattr(s, "_list_repos_for_org", lambda api, org: [
+        "r1", "r2", "r3", "r4", "r5"
+    ])
+
+    counts_by_repo = {"r1": 5, "r2": 0, "r3": 3, "r4": 7, "r5": 1}
+
+    def fake_batch(queries, api):
+        out = []
+        for q in queries:
+            # q is like: repo:Automattic/rX rest...
+            try:
+                repo_part = [p for p in q.split() if p.startswith("repo:")][0]
+                name = repo_part.split("/")[-1]
+            except Exception:
+                name = ""
+            out.append(counts_by_repo.get(name, 0))
+        return out
+
+    monkeypatch.setattr(s, "_search_aggregate_count_batch", fake_batch)
+
+    q = "org:Automattic is:issue created:2025-01-01..2025-01-31"
+    out = s._search_with_repo_breakdown(q, "https://api.github.com")
+
+    # Zero counts are not included by implementation
+    assert out == {"r1": 5, "r3": 3, "r4": 7, "r5": 1}
+
+
+def test_repo_scoped_fast_path_issuecount(monkeypatch):
+    """
+    Repo-scoped query should issue a single aggregate count and return that mapping.
+    """
+    s = _mk_stream()
+
+    def fake_single(query, api):
+        assert query.startswith("repo:Automattic/calypso ")
+        return 42
+
+    monkeypatch.setattr(s, "_search_aggregate_count", fake_single)
+
+    q = "repo:Automattic/calypso is:issue created:2025-02-01..2025-02-28"
+    out = s._search_with_repo_breakdown(q, "https://api.github.com")
+    assert out == {"calypso": 42}
