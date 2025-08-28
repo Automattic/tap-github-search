@@ -37,10 +37,11 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     replication_method: ClassVar[str] = REPLICATION_METHOD
     replication_key: ClassVar[str] = REPLICATION_KEY
     state_partitioning_keys: ClassVar[list[str]] = STATE_KEYS
-    selected_by_default: bool = True  # Enable standard stream selection
+    selected_by_default: bool = True
 
     def __init__(self, tap, name=None, schema=None, path=None):
         self.tap = tap
+        self._repo_cache: dict[str, list[str]] = {}
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
     _authenticator: WrapperGitHubTokenAuthenticator | None = None
@@ -166,8 +167,32 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 }
 
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
-        total_count = self._search_aggregate_count(query, api_url_base)
-        return self._compute_repo_counts(query, api_url_base, total_count)
+        """
+        Per-repo breakdown via aggregate counts: one search per repo using issueCount.
+        """
+        # If already repo-scoped, just return that repo's aggregate count.
+        repo_m = re.search(r"\brepo:([^\s/]+)/([^\s]+)", query)
+        if repo_m:
+            repo_name = repo_m.group(2).lower()
+            return {repo_name: self._search_aggregate_count(query, api_url_base)}
+
+        # Expect an org-scoped query; fall back to legacy if not found.
+        org_m = re.search(r"\borg:([^\s]+)", query)
+        if not org_m:
+            total_count = self._search_aggregate_count(query, api_url_base)
+            return self._compute_repo_counts(query, api_url_base, total_count)
+
+        org = org_m.group(1)
+        repos = self._list_repos_for_org(api_url_base, org)
+        rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
+
+        counts: dict[str, int] = {}
+        for name in repos:
+            repo_q = f"repo:{org}/{name} {rest_query}".strip()
+            c = self._search_aggregate_count(repo_q, api_url_base)
+            if c:
+                counts[name] = c
+        return counts
 
     def _compute_repo_counts(self, query: str, api_url_base: str, total_count: int) -> dict[str, int]:
         if total_count <= 1000:
@@ -199,45 +224,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return dict(repo_counts)
 
     def _search_with_auto_slicing(self, query: str, api_url_base: str) -> dict[str, int]:
-        # NEW: support "open-in-month" pattern by fanning into two created:RANGE buckets
-        # Pattern we emit upstream for "open in MONTH":
-        #   created:<=END  -closed:<START
-        # Equivalent to UNION of:
-        #   A) created:[LOWER_BOUND..START-1] -closed:<START
-        #   B) created:[START..END]           -closed:<START
-        created_le = re.search(r"\bcreated:<=([0-9]{4}-[0-9]{2}-[0-9]{2})\b", query)
-        closed_lt  = re.search(r"-closed:<([0-9]{4}-[0-9]{2}-[0-9]{2})\b", query)
-        if created_le and closed_lt:
-            end_str   = created_le.group(1)   # e.g. 2025-01-31
-            start_str = closed_lt.group(1)    # e.g. 2025-01-01
-            try:
-                start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
-                end_dt   = datetime.strptime(end_str,   "%Y-%m-%d").date()
-            except ValueError:
-                start_dt = None
-                end_dt   = None
-            if start_dt and end_dt and start_dt <= end_dt:
-                lower_bound = os.environ.get("GITHUB_CREATED_LOWER_BOUND", "2008-01-01")
-                day_before_start = (start_dt - timedelta(days=1)).isoformat()
-                # Replace the single 'created:<=END' with a RANGE for each bucket
-                q_preexisting = re.sub(
-                    r"\bcreated:<=\d{4}-\d{2}-\d{2}\b",
-                    f"created:{lower_bound}..{day_before_start}",
-                    query,
-                    count=1,
-                )
-                q_inmonth = re.sub(
-                    r"\bcreated:<=\d{4}-\d{2}-\d{2}\b",
-                    f"created:{start_str}..{end_str}",
-                    query,
-                    count=1,
-                )
-                combined: Counter[str] = Counter()
-                for q_slice in (q_preexisting, q_inmonth):
-                    combined.update(self._search_with_auto_slicing(q_slice, api_url_base))
-                return dict(combined)
-
-        # EXISTING: handle explicit created:RANGE by weekly slicing
         date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
         if not date_match:
             return self._get_repo_counts_from_nodes(query, api_url_base)
@@ -258,6 +244,35 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 repo_counts.update({repo: count})
             current = slice_end + timedelta(days=1)
         return dict(repo_counts)
+
+    def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
+        if org in self._repo_cache:
+            return self._repo_cache[org]
+        q = (
+            """
+        query($org:String!, $after:String){
+          organization(login:$org){
+            repositories(first:100, after:$after){
+              pageInfo { hasNextPage endCursor }
+              nodes { name }
+            }
+          }
+        }
+        """
+        )
+        names: list[str] = []
+        after = None
+        while True:
+            payload = {"query": q, "variables": {"org": org, "after": after}}
+            prepared = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+            resp = self._request(prepared, None)
+            data = resp.json()["data"]["organization"]["repositories"]
+            names.extend([n["name"] for n in data["nodes"]])
+            if not data["pageInfo"]["hasNextPage"]:
+                break
+            after = data["pageInfo"]["endCursor"]
+        self._repo_cache[org] = names
+        return names
 
 
 class ConfigurableSearchCountStream(SearchCountStreamBase):
