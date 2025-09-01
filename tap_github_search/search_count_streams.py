@@ -242,15 +242,16 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         self.logger.info(f"⏱️ 🔍 Large dataset completed in {elapsed:.1f}s")
         return result
     
-    def _prefilter_repos_with_results(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> list[str]:
-        """Pre-filter repos to only include those with matching issues."""
+    def _prefilter_repos_with_results(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> tuple[list[str], dict[str, int]]:
+        """Pre-filter repos to only include those with matching issues and return their counts."""
         if not repos:
-            return []
+            return [], {}
             
         # Use larger batches for pre-filtering since we only need > 0 counts
         # With ~10% hit rate, we can safely use much larger batches
         prefilter_batch_size = 300
         active_repos = []
+        repo_counts = {}  # NEW: preserve the actual counts
         total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
         
         self.logger.info(f"⏱️ 🔍 Pre-filtering {len(repos)} repos in {total_batches} batches...")
@@ -261,81 +262,44 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             
             try:
                 counts = self._search_aggregate_count_batch(queries, api_url_base)
-                # Only keep repos with count > 0
+                # Keep repos with count > 0 AND preserve their counts
                 batch_active = 0
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:
                         active_repos.append(repo_name)
+                        repo_counts[repo_name] = count  # NEW: save the count
                         batch_active += 1
                 self.logger.info(f"⏱️ 🔍 Pre-filter batch {batch_idx+1}/{total_batches}: {batch_active}/{len(batch_repos)} repos have results")
             except Exception as e:
                 self.logger.warning(f"⏱️ 📦 Pre-filter batch failed, including all repos: {str(e)}")
-                active_repos.extend(batch_repos)
+                # On error, include all repos but with zero counts as fallback
+                for repo_name in batch_repos:
+                    active_repos.append(repo_name)
+                    repo_counts[repo_name] = 0
                 
-        return active_repos
+        return active_repos, repo_counts
             
     def _get_repo_counts_via_batching(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> dict[str, int]:
-        """Helper method for batched repo count fetching."""
+        """Helper method for batched repo count fetching - now uses pre-filtering results directly."""
         start_time = time.time()
-        counts: dict[str, int] = {}
         if not repos:
-            return counts
+            return {}
         
-        # Phase 1: Pre-filter to only include repos with results
+        # Pre-filter and get counts in one pass - no duplicate queries!
         prefilter_start = time.time()
-        active_repos = self._prefilter_repos_with_results(repos, org, rest_query, api_url_base)
+        active_repos, counts = self._prefilter_repos_with_results(repos, org, rest_query, api_url_base)
         prefilter_time = time.time() - prefilter_start
         
         if not active_repos:
             self.logger.info(f"⏱️ 📦 No repos with results found after pre-filtering in {prefilter_time:.1f}s")
-            return counts
+            return {}
             
         self.logger.info(f"⏱️ 📦 Pre-filtered from {len(repos)} to {len(active_repos)} repos with results in {prefilter_time:.1f}s")
-            
-        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "100")) or 100
         
-        repo_names: list[str] = []
-        queries: list[str] = []
-        for name in active_repos:
-            repo_names.append(name)
-            queries.append(f"repo:{org}/{name} {rest_query}".strip())
-
-        total_batches = (len(queries) + batch_size - 1) // batch_size
-        for batch_idx, i in enumerate(range(0, len(queries), batch_size)):
-            batch_start = time.time()
-            q_batch = queries[i : i + batch_size]
-            n_batch = repo_names[i : i + batch_size]
-            
-            try:
-                batch_counts = self._search_aggregate_count_batch(q_batch, api_url_base)
-            except Exception as e:
-                # If large batch fails, try with smaller batches
-                if len(q_batch) > 20:
-                    self.logger.warning(f"⏱️ 📦 Large batch failed, trying smaller batches: {str(e)}")
-                    batch_counts = []
-                    for j in range(0, len(q_batch), 20):
-                        small_batch = q_batch[j:j+20]
-                        try:
-                            small_counts = self._search_aggregate_count_batch(small_batch, api_url_base)
-                            batch_counts.extend(small_counts)
-                        except Exception as e2:
-                            self.logger.error(f"⏱️ 📦 Small batch also failed: {str(e2)}")
-                            batch_counts.extend([0] * len(small_batch))
-                else:
-                    self.logger.error(f"⏱️ 📦 Batch failed: {str(e)}")
-                    batch_counts = [0] * len(q_batch)
-            
-            batch_results = 0
-            for repo_name, c in zip(n_batch, batch_counts):
-                if c:
-                    counts[repo_name] = c
-                    batch_results += 1
-                    
-            batch_time = time.time() - batch_start
-            self.logger.info(f"⏱️ 📦 Batch {batch_idx+1}/{total_batches}: {batch_results} repos with results in {batch_time:.1f}s")
-        
+        # No final batching needed - we already have the counts!
         elapsed = time.time() - start_time
         total_results = len([c for c in counts.values() if c > 0])
+        self.logger.info(f"⏱️ 📦 Optimization: Using pre-filter counts directly, no duplicate queries needed!")
         self.logger.info(f"⏱️ 📦 Batching completed: {total_results} repos with results in {elapsed:.1f}s")
         return counts
 
