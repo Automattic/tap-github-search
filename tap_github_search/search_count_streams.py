@@ -296,8 +296,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if not repos:
             return [], {}
             
-        # Use fixed batch size for optimal performance
-        prefilter_batch_size = 150
+        # Use optimized batch size balancing complexity vs batch count
+        prefilter_batch_size = 140
         active_repos = []
         repo_counts = {}
         total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
