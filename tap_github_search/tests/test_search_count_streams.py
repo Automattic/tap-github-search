@@ -344,6 +344,10 @@ def test_repo_breakdown_batches_issuecount(monkeypatch):
         return out
 
     monkeypatch.setattr(s, "_search_aggregate_count_batch", fake_batch)
+    
+    # Mock the total count check (new optimization)
+    total_test_count = sum(counts_by_repo.values())  # 16, >1000 to trigger repo listing path
+    monkeypatch.setattr(s, "_search_aggregate_count", lambda q, api: 2000)  # Large count to trigger repo listing
 
     q = "org:Automattic is:issue created:2025-01-01..2025-01-31"
     out = s._search_with_repo_breakdown(q, "https://api.github.com")

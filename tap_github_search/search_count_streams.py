@@ -15,6 +15,9 @@ from singer_sdk.helpers.types import Context
 from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 
+# Global repo cache shared across all stream instances
+_REPO_CACHE: dict[str, list[str]] = {}
+
 from tap_github_search.utils.date_utils import (
     get_last_complete_month,
     get_last_complete_month_date,
@@ -41,7 +44,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
     def __init__(self, tap, name=None, schema=None, path=None):
         self.tap = tap
-        self._repo_cache: dict[str, list[str]] = {}
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
     _authenticator: WrapperGitHubTokenAuthenticator | None = None
@@ -183,12 +185,27 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return self._compute_repo_counts(query, api_url_base, total_count)
 
         org = org_m.group(1)
-        repos = self._list_repos_for_org(api_url_base, org)
         rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
-
+        
+        # Optimization: Check total count first to decide strategy
+        total_count = self._search_aggregate_count(query, api_url_base)
+        if total_count == 0:
+            return {}
+            
+        # For small datasets, get repo names from search results (faster)
+        if total_count <= 1000:
+            return self._get_repo_counts_from_nodes(query, api_url_base)
+            
+        # For large datasets, use repo listing + batching approach
+        repos = self._list_repos_for_org(api_url_base, org)
+        return self._get_repo_counts_via_batching(repos, org, rest_query, api_url_base)
+            
+    def _get_repo_counts_via_batching(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> dict[str, int]:
+        """Helper method for batched repo count fetching."""
         counts: dict[str, int] = {}
         if not repos:
             return counts
+            
         batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "20")) or 20
         repo_names: list[str] = []
         queries: list[str] = []
@@ -345,8 +362,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return dict(repo_counts)
 
     def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
-        if org in self._repo_cache:
-            return self._repo_cache[org]
+        if org in _REPO_CACHE:
+            return _REPO_CACHE[org]
         q = (
             """
         query($org:String!, $after:String){
@@ -370,7 +387,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             if not data["pageInfo"]["hasNextPage"]:
                 break
             after = data["pageInfo"]["endCursor"]
-        self._repo_cache[org] = names
+        _REPO_CACHE[org] = names
         return names
 
 
