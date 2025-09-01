@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
@@ -125,15 +126,21 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
+        start_time = time.time()
         now = datetime.utcnow().isoformat() + "Z"
         partitions_to_process = [context] if context else self.partitions
-        for partition in partitions_to_process:
+        self.logger.info(f"⏱️ Processing {len(partitions_to_process)} partitions")
+        
+        for i, partition in enumerate(partitions_to_process):
+            partition_start = time.time()
             org = partition["org"]
             month = partition["month"]
             query = partition["search_query"]
             api_url_base = partition["api_url_base"]
             repo_breakdown = partition.get("repo_breakdown", False)
             search_name = partition["search_name"]
+            
+            self.logger.info(f"⏱️ [{i+1}/{len(partitions_to_process)}] Processing {org} {month} (breakdown={repo_breakdown})")
 
             if repo_breakdown:
                 repo_counts = self._search_with_repo_breakdown(query, api_url_base)
@@ -167,59 +174,104 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                     "count": total_count,
                     "updated_at": now,
                 }
+            
+            partition_time = time.time() - partition_start
+            self.logger.info(f"⏱️ [{i+1}/{len(partitions_to_process)}] Completed {org} {month} in {partition_time:.1f}s")
+        
+        total_time = time.time() - start_time
+        self.logger.info(f"⏱️ Total processing time: {total_time:.1f}s ({total_time/60:.1f}m)")
 
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
         """
         Per-repo breakdown via aggregate counts: one search per repo using issueCount.
         """
+        start_time = time.time()
+        self.logger.info(f"⏱️ 🔍 Starting repo breakdown for query: {query[:100]}...")
+        
         # If already repo-scoped, just return that repo's aggregate count.
         repo_m = re.search(r"\brepo:([^\s/]+)/([^\s]+)", query)
         if repo_m:
             repo_name = repo_m.group(2).lower()
-            return {repo_name: self._search_aggregate_count(query, api_url_base)}
+            count = self._search_aggregate_count(query, api_url_base)
+            elapsed = time.time() - start_time
+            self.logger.info(f"⏱️ 🔍 Repo-scoped query completed in {elapsed:.1f}s")
+            return {repo_name: count}
 
         # Expect an org-scoped query; fall back to legacy if not found.
         org_m = re.search(r"\borg:([^\s]+)", query)
         if not org_m:
             total_count = self._search_aggregate_count(query, api_url_base)
-            return self._compute_repo_counts(query, api_url_base, total_count)
+            result = self._compute_repo_counts(query, api_url_base, total_count)
+            elapsed = time.time() - start_time
+            self.logger.info(f"⏱️ 🔍 Non-org query completed in {elapsed:.1f}s")
+            return result
 
         org = org_m.group(1)
         rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
         
         # Optimization: Check total count first to decide strategy
+        count_start = time.time()
         total_count = self._search_aggregate_count(query, api_url_base)
+        count_time = time.time() - count_start
+        self.logger.info(f"⏱️ 🔍 Total count check: {total_count} results in {count_time:.1f}s")
+        
         if total_count == 0:
+            elapsed = time.time() - start_time
+            self.logger.info(f"⏱️ 🔍 Zero results, completed in {elapsed:.1f}s")
             return {}
             
         # For small datasets, get repo names from search results (faster)
         if total_count <= 1000:
-            return self._get_repo_counts_from_nodes(query, api_url_base)
+            self.logger.info(f"⏱️ 🔍 Using nodes approach for {total_count} results")
+            result = self._get_repo_counts_from_nodes(query, api_url_base)
+            elapsed = time.time() - start_time
+            self.logger.info(f"⏱️ 🔍 Small dataset completed in {elapsed:.1f}s")
+            return result
             
         # For large datasets, use repo listing + batching approach
+        self.logger.info(f"⏱️ 🔍 Using batching approach for {total_count} results")
         repos = self._list_repos_for_org(api_url_base, org)
-        return self._get_repo_counts_via_batching(repos, org, rest_query, api_url_base)
+        result = self._get_repo_counts_via_batching(repos, org, rest_query, api_url_base)
+        elapsed = time.time() - start_time
+        self.logger.info(f"⏱️ 🔍 Large dataset completed in {elapsed:.1f}s")
+        return result
             
     def _get_repo_counts_via_batching(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> dict[str, int]:
         """Helper method for batched repo count fetching."""
+        start_time = time.time()
         counts: dict[str, int] = {}
         if not repos:
             return counts
             
         batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "20")) or 20
+        self.logger.info(f"⏱️ 📦 Batching {len(repos)} repos with batch_size={batch_size}")
+        
         repo_names: list[str] = []
         queries: list[str] = []
         for name in repos:
             repo_names.append(name)
             queries.append(f"repo:{org}/{name} {rest_query}".strip())
 
-        for i in range(0, len(queries), batch_size):
+        total_batches = (len(queries) + batch_size - 1) // batch_size
+        for batch_idx, i in enumerate(range(0, len(queries), batch_size)):
+            batch_start = time.time()
             q_batch = queries[i : i + batch_size]
             n_batch = repo_names[i : i + batch_size]
+            
             batch_counts = self._search_aggregate_count_batch(q_batch, api_url_base)
+            
+            batch_results = 0
             for repo_name, c in zip(n_batch, batch_counts):
                 if c:
                     counts[repo_name] = c
+                    batch_results += 1
+                    
+            batch_time = time.time() - batch_start
+            self.logger.info(f"⏱️ 📦 Batch {batch_idx+1}/{total_batches}: {batch_results} repos with results in {batch_time:.1f}s")
+        
+        elapsed = time.time() - start_time
+        total_results = len([c for c in counts.values() if c > 0])
+        self.logger.info(f"⏱️ 📦 Batching completed: {total_results} repos with results in {elapsed:.1f}s")
         return counts
 
     def _search_aggregate_count_batch(self, queries: list[str], api_url_base: str) -> list[int]:
@@ -363,7 +415,12 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
     def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
         if org in _REPO_CACHE:
+            self.logger.info(f"⏱️ 💾 Using cached repo list for {org}: {len(_REPO_CACHE[org])} repos")
             return _REPO_CACHE[org]
+            
+        start_time = time.time()
+        self.logger.info(f"⏱️ 📋 Fetching repo list for {org}...")
+        
         q = (
             """
         query($org:String!, $after:String){
@@ -378,15 +435,25 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         )
         names: list[str] = []
         after = None
+        page_count = 0
         while True:
+            page_start = time.time()
             payload = {"query": q, "variables": {"org": org, "after": after}}
             prepared = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
             resp = self._request(prepared, None)
             data = resp.json()["data"]["organization"]["repositories"]
-            names.extend([n["name"] for n in data["nodes"]])
+            page_repos = [n["name"] for n in data["nodes"]]
+            names.extend(page_repos)
+            page_count += 1
+            page_time = time.time() - page_start
+            self.logger.info(f"⏱️ 📋 Page {page_count}: {len(page_repos)} repos in {page_time:.1f}s")
+            
             if not data["pageInfo"]["hasNextPage"]:
                 break
             after = data["pageInfo"]["endCursor"]
+            
+        elapsed = time.time() - start_time
+        self.logger.info(f"⏱️ 📋 Repo listing completed: {len(names)} repos in {elapsed:.1f}s")
         _REPO_CACHE[org] = names
         return names
 
