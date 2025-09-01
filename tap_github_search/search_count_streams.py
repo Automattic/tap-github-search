@@ -241,6 +241,37 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         elapsed = time.time() - start_time
         self.logger.info(f"⏱️ 🔍 Large dataset completed in {elapsed:.1f}s")
         return result
+    
+    def _prefilter_repos_with_results(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> list[str]:
+        """Pre-filter repos to only include those with matching issues."""
+        if not repos:
+            return []
+            
+        # Use larger batches for pre-filtering since we only need > 0 counts
+        prefilter_batch_size = 100
+        active_repos = []
+        total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
+        
+        self.logger.info(f"⏱️ 🔍 Pre-filtering {len(repos)} repos in {total_batches} batches...")
+        
+        for batch_idx, i in enumerate(range(0, len(repos), prefilter_batch_size)):
+            batch_repos = repos[i:i + prefilter_batch_size]
+            queries = [f"repo:{org}/{name} {rest_query}".strip() for name in batch_repos]
+            
+            try:
+                counts = self._search_aggregate_count_batch(queries, api_url_base)
+                # Only keep repos with count > 0
+                batch_active = 0
+                for repo_name, count in zip(batch_repos, counts):
+                    if count > 0:
+                        active_repos.append(repo_name)
+                        batch_active += 1
+                self.logger.info(f"⏱️ 🔍 Pre-filter batch {batch_idx+1}/{total_batches}: {batch_active}/{len(batch_repos)} repos have results")
+            except Exception as e:
+                self.logger.warning(f"⏱️ 📦 Pre-filter batch failed, including all repos: {str(e)}")
+                active_repos.extend(batch_repos)
+                
+        return active_repos
             
     def _get_repo_counts_via_batching(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> dict[str, int]:
         """Helper method for batched repo count fetching."""
@@ -248,13 +279,23 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         counts: dict[str, int] = {}
         if not repos:
             return counts
+        
+        # Phase 1: Pre-filter to only include repos with results
+        prefilter_start = time.time()
+        active_repos = self._prefilter_repos_with_results(repos, org, rest_query, api_url_base)
+        prefilter_time = time.time() - prefilter_start
+        
+        if not active_repos:
+            self.logger.info(f"⏱️ 📦 No repos with results found after pre-filtering in {prefilter_time:.1f}s")
+            return counts
+            
+        self.logger.info(f"⏱️ 📦 Pre-filtered from {len(repos)} to {len(active_repos)} repos with results in {prefilter_time:.1f}s")
             
         batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "40")) or 40
-        self.logger.info(f"⏱️ 📦 Batching {len(repos)} repos with batch_size={batch_size}")
         
         repo_names: list[str] = []
         queries: list[str] = []
-        for name in repos:
+        for name in active_repos:
             repo_names.append(name)
             queries.append(f"repo:{org}/{name} {rest_query}".strip())
 
@@ -320,8 +361,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 uncached_queries.append(query)
                 uncached_indices.append(idx)
         
-        if cache_hits > 0:
-            self.logger.info(f"⏱️ 💾 Cache hits: {cache_hits}/{len(queries)} queries")
         
         # If all queries are cached, return early
         if not uncached_queries:
@@ -534,7 +573,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 total_excluded[key] += excluded_count[key]
             
             excluded_total = sum(excluded_count.values())
-            self.logger.info(f"⏱️ 📋 Page {page_count}: {len(filtered_repos)} active repos ({excluded_total} excluded: {excluded_count}) in {page_time:.1f}s")
             
             if not data["pageInfo"]["hasNextPage"]:
                 break
