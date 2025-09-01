@@ -9,6 +9,9 @@ from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
 from collections import Counter
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from singer_sdk import typing as th
 from singer_sdk.helpers.types import Context
@@ -22,6 +25,34 @@ _REPO_CACHE: dict[str, list[str]] = {}
 # Global search count cache to avoid re-running identical queries
 _SEARCH_CACHE: dict[str, int] = {}
 _SEARCH_CACHE_MAX_SIZE = 10000  # Limit cache size to prevent memory issues
+
+# Global HTTP session with connection pooling
+_HTTP_SESSION: requests.Session | None = None
+
+def _get_http_session() -> requests.Session:
+    """Get or create a global HTTP session with connection pooling and retry strategy."""
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        _HTTP_SESSION = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        
+        # Configure HTTP adapter with connection pooling
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,  # Number of connection pools to cache
+            pool_maxsize=20,     # Maximum number of connections to save in pool
+        )
+        
+        _HTTP_SESSION.mount("https://", adapter)
+        _HTTP_SESSION.mount("http://", adapter)
+        
+    return _HTTP_SESSION
 
 from tap_github_search.utils.date_utils import (
     get_last_complete_month,
@@ -52,6 +83,24 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
     _authenticator: WrapperGitHubTokenAuthenticator | None = None
+
+    def _request(self, prepared_request, context):
+        """Override to use global HTTP session with connection pooling."""
+        session = _get_http_session()
+        
+        # Apply authentication headers
+        if self.authenticator:
+            prepared_request.headers.update(self.authenticator.auth_headers or {})
+            
+        try:
+            response = session.send(prepared_request, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 502:
+                # Log 502 error for batch size reduction
+                self.logger.warning(f"⚠️ 502 Bad Gateway error - consider reducing batch size")
+            raise
 
     @classmethod
     def _build_search_schema(cls) -> dict:
@@ -247,13 +296,13 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if not repos:
             return [], {}
             
-        # Use larger batches for pre-filtering since we only need > 0 counts
+        # Use fixed batch size for optimal performance
         prefilter_batch_size = 150
         active_repos = []
-        repo_counts = {}  # NEW: preserve the actual counts
+        repo_counts = {}
         total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
         
-        self.logger.info(f"⏱️ 🔍 Pre-filtering {len(repos)} repos in {total_batches} batches...")
+        self.logger.info(f"⏱️ 🔍 Pre-filtering {len(repos)} repos in {total_batches} batches (batch_size={prefilter_batch_size})...")
         
         for batch_idx, i in enumerate(range(0, len(repos), prefilter_batch_size)):
             batch_repos = repos[i:i + prefilter_batch_size]
@@ -269,8 +318,41 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                         repo_counts[repo_name] = count  # NEW: save the count
                         batch_active += 1
                 self.logger.info(f"⏱️ 🔍 Pre-filter batch {batch_idx+1}/{total_batches}: {batch_active}/{len(batch_repos)} repos have results")
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 502:
+                    # Simple 502 fallback: retry with smaller batches
+                    self.logger.warning(f"⚠️ 502 Bad Gateway - retrying batch with smaller size")
+                    
+                    # Split into batches of 50 and retry
+                    batch_results = []
+                    for j in range(0, len(batch_repos), 50):
+                        small_batch = batch_repos[j:j + 50]
+                        small_queries = [f"repo:{org}/{name} {rest_query}".strip() for name in small_batch]
+                        try:
+                            small_counts = self._search_aggregate_count_batch(small_queries, api_url_base)
+                            batch_results.extend(list(zip(small_batch, small_counts)))
+                        except Exception:
+                            # If small batch fails, include with zero counts
+                            batch_results.extend([(name, 0) for name in small_batch])
+                    
+                    # Process results
+                    batch_active = 0
+                    for repo_name, count in batch_results:
+                        if count > 0:
+                            active_repos.append(repo_name)
+                            repo_counts[repo_name] = count
+                            batch_active += 1
+                        else:
+                            repo_counts[repo_name] = 0
+                    self.logger.info(f"⏱️ 🔍 Pre-filter batch {batch_idx+1}/{total_batches} (retry): {batch_active}/{len(batch_repos)} repos have results")
+                else:
+                    self.logger.warning(f"⏱️ 📦 Pre-filter batch failed: {str(e)}")
+                    # On other errors, include all repos but with zero counts as fallback
+                    for repo_name in batch_repos:
+                        active_repos.append(repo_name)
+                        repo_counts[repo_name] = 0
             except Exception as e:
-                self.logger.warning(f"⏱️ 📦 Pre-filter batch failed, including all repos: {str(e)}")
+                self.logger.warning(f"⏱️ 📦 Pre-filter batch failed: {str(e)}")
                 # On error, include all repos but with zero counts as fallback
                 for repo_name in batch_repos:
                     active_repos.append(repo_name)
