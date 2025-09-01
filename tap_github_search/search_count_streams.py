@@ -268,6 +268,64 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
         if not date_match:
             return self._get_repo_counts_from_nodes(query, api_url_base)
+        
+        # Try batched approach first for better performance
+        try:
+            return self._search_with_auto_slicing_batched(query, api_url_base)
+        except Exception as e:
+            self.logger.warning(f"Batched slicing failed, falling back to individual queries: {e}")
+            return self._search_with_auto_slicing_individual(query, api_url_base)
+    
+    def _search_with_auto_slicing_batched(self, query: str, api_url_base: str) -> dict[str, int]:
+        """Batched version of auto-slicing for better performance."""
+        date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
+        if not date_match:
+            return self._get_repo_counts_from_nodes(query, api_url_base)
+            
+        start_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
+        end_date = datetime.strptime(date_match.group(2), "%Y-%m-%d")
+        slice_days = int(os.environ.get("GITHUB_SEARCH_SLICE_DAYS", "5")) or 5
+        
+        # Generate all slice queries upfront
+        slice_queries: list[str] = []
+        current = start_date
+        while current <= end_date:
+            slice_end = min(current + timedelta(days=slice_days - 1), end_date)
+            slice_query = re.sub(
+                r"created:\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}",
+                f"created:{current.strftime('%Y-%m-%d')}..{slice_end.strftime('%Y-%m-%d')}",
+                query,
+            )
+            slice_queries.append(slice_query)
+            current = slice_end + timedelta(days=1)
+        
+        # Get aggregate counts for all slices in batched calls
+        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "20")) or 20
+        repo_counts: Counter[str] = Counter()
+        
+        for i in range(0, len(slice_queries), batch_size):
+            batch_queries = slice_queries[i:i + batch_size]
+            batch_counts = self._search_aggregate_count_batch(batch_queries, api_url_base)
+            
+            # For each slice, get repo breakdown from nodes if count > 0
+            for slice_query, total_count in zip(batch_queries, batch_counts):
+                if total_count > 0:
+                    if total_count <= 1000:
+                        slice_repo_counts = self._get_repo_counts_from_nodes(slice_query, api_url_base)
+                    else:
+                        # If still too large, fall back to individual approach for this slice
+                        slice_repo_counts = self._search_with_auto_slicing_individual(slice_query, api_url_base)
+                    
+                    for repo, count in slice_repo_counts.items():
+                        repo_counts[repo] += count
+        
+        return dict(repo_counts)
+    
+    def _search_with_auto_slicing_individual(self, query: str, api_url_base: str) -> dict[str, int]:
+        """Original individual query version as fallback."""
+        date_match = re.search(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", query)
+        if not date_match:
+            return self._get_repo_counts_from_nodes(query, api_url_base)
         start_date = datetime.strptime(date_match.group(1), "%Y-%m-%d")
         end_date = datetime.strptime(date_match.group(2), "%Y-%m-%d")
         repo_counts: Counter[str] = Counter()
@@ -282,7 +340,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             )
             slice_counts = self._get_repo_counts_from_nodes(slice_query, api_url_base)
             for repo, count in slice_counts.items():
-                repo_counts.update({repo: count})
+                repo_counts[repo] += count
             current = slice_end + timedelta(days=1)
         return dict(repo_counts)
 
