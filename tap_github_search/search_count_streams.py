@@ -291,7 +291,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             
         self.logger.info(f"⏱️ 📦 Pre-filtered from {len(repos)} to {len(active_repos)} repos with results in {prefilter_time:.1f}s")
             
-        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "40")) or 40
+        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "100")) or 100
         
         repo_names: list[str] = []
         queries: list[str] = []
@@ -466,7 +466,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             current = slice_end + timedelta(days=1)
         
         # Get aggregate counts for all slices in batched calls
-        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "40")) or 40
+        batch_size = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "100")) or 100
         repo_counts: Counter[str] = Counter()
         
         for i in range(0, len(slice_queries), batch_size):
