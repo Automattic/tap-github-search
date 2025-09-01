@@ -248,7 +248,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return [], {}
             
         # Use larger batches for pre-filtering since we only need > 0 counts
-        prefilter_batch_size = 100
+        prefilter_batch_size = 150
         active_repos = []
         repo_counts = {}  # NEW: preserve the actual counts
         total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
