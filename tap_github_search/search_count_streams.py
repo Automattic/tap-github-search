@@ -228,10 +228,17 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             self.logger.info(f"⏱️ 🔍 Small dataset completed in {elapsed:.1f}s")
             return result
             
-        # For large datasets, use repo listing + batching approach
-        self.logger.info(f"⏱️ 🔍 Using batching approach for {total_count} results")
-        repos = self._list_repos_for_org(api_url_base, org)
-        result = self._get_repo_counts_via_batching(repos, org, rest_query, api_url_base)
+        # For large datasets, use optimized approach: first identify active repos from search results
+        self.logger.info(f"⏱️ 🔍 Using optimized repo filtering for {total_count} results")
+        active_repos = self._get_active_repos_from_search(query, api_url_base)
+        self.logger.info(f"⏱️ 🎯 Found {len(active_repos)} active repos with matching issues")
+        
+        if not active_repos:
+            elapsed = time.time() - start_time
+            self.logger.info(f"⏱️ 🔍 No active repos found in {elapsed:.1f}s")
+            return {}
+        
+        result = self._get_repo_counts_via_batching(active_repos, org, rest_query, api_url_base)
         elapsed = time.time() - start_time
         self.logger.info(f"⏱️ 🔍 Large dataset completed in {elapsed:.1f}s")
         return result
@@ -456,6 +463,49 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         self.logger.info(f"⏱️ 📋 Repo listing completed: {len(names)} repos in {elapsed:.1f}s")
         _REPO_CACHE[org] = names
         return names
+
+    def _get_active_repos_from_search(self, query: str, api_url_base: str) -> list[str]:
+        """
+        Get list of repos that have at least one matching issue by scanning search results.
+        This avoids having to query every single repo in the org.
+        """
+        start_time = time.time()
+        self.logger.info(f"⏱️ 🎯 Scanning search results to identify active repos...")
+        
+        repo_names = set()
+        after = None
+        pages_scanned = 0
+        
+        # Scan through search results to collect unique repo names
+        while True:
+            payload = {"query": self.query, "variables": {"q": query, "after": after}}
+            prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+            response = self._request(prepared_request, None)
+            response_json = response.json()
+            search = response_json["data"]["search"]
+            
+            # Extract repo names from search results
+            for node in search["nodes"]:
+                repo_name = node["repository"]["name"]
+                repo_names.add(repo_name)
+            
+            pages_scanned += 1
+            self.logger.info(f"⏱️ 🎯 Page {pages_scanned}: found {len(repo_names)} unique active repos so far")
+            
+            if not search["pageInfo"]["hasNextPage"]:
+                break
+            after = search["pageInfo"]["endCursor"]
+            
+            # Safety limit to avoid infinite loops
+            if pages_scanned >= 50:  # 50 pages * 100 results = 5000 max results
+                self.logger.warning(f"⏱️ 🎯 Reached safety limit of {pages_scanned} pages")
+                break
+        
+        active_repos = list(repo_names)
+        elapsed = time.time() - start_time
+        self.logger.info(f"⏱️ 🎯 Active repo scan completed: {len(active_repos)} repos in {elapsed:.1f}s from {pages_scanned} pages")
+        
+        return active_repos
 
 
 class ConfigurableSearchCountStream(SearchCountStreamBase):
