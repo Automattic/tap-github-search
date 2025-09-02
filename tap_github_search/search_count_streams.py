@@ -7,6 +7,8 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
+import base64
+import json
 from collections import Counter
 import requests
 from requests.adapters import HTTPAdapter
@@ -590,9 +592,48 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     return errors
 
 
+def _decode_search_config(tap) -> dict | None:
+    """Decode search configuration from Base64, file, or direct JSON."""
+    # Try Base64 decoding first (Option B)
+    b64_search = os.getenv("TAP_GITHUB_SEARCH_STATS_SEARCH_B64")
+    if b64_search:
+        try:
+            decoded = base64.b64decode(b64_search).decode("utf-8")
+            return json.loads(decoded)
+        except Exception as e:
+            tap.logger.warning(f"Failed to decode Base64 search config: {e}")
+    
+    # Try file loading (Option A - future enhancement)
+    search_file = os.getenv("TAP_GITHUB_SEARCH_STATS_SEARCH_FILE")
+    if search_file:
+        try:
+            with open(search_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            tap.logger.warning(f"Failed to load search config from file {search_file}: {e}")
+    
+    # Fallback to direct JSON from env var (legacy)
+    search_json = os.getenv("TAP_GITHUB_SEARCH_STATS_SEARCH")
+    if search_json:
+        try:
+            return json.loads(search_json)
+        except Exception as e:
+            tap.logger.warning(f"Failed to parse direct search config JSON: {e}")
+    
+    return None
+
+
 def create_configurable_streams(tap, config_override: dict | None = None) -> list:
     streams: list[ConfigurableSearchCountStream] = []
     config = config_override or tap.config
+    
+    # Try to get search config from environment variables first
+    env_search_config = _decode_search_config(tap)
+    if env_search_config:
+        tap.logger.info("Using search configuration from environment variables")
+        config = dict(config)  # Make a copy
+        config["search"] = env_search_config
+    
     if "search" in config:
         s = config.get("search", {})
         for sd in s.get("streams", []):
