@@ -2,17 +2,16 @@ from __future__ import annotations
 
 from datetime import date
 import os
-import types
 import logging
 from unittest.mock import Mock, patch
 import pytest
-import requests
 
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     create_configurable_streams,
     validate_stream_config,
     SearchCountStreamBase,
+    BATCH_SIZE,
 )
 from tap_github_search.tap import TapGitHubSearch
 from tap_github_search.authenticator import GHEPersonalTokenManager
@@ -317,14 +316,11 @@ def test_no_created_falls_back(monkeypatch):
 
 def test_repo_breakdown_batches_issuecount(monkeypatch):
     """
-    Org-scoped breakdown should call batched aggregate counts and return per-repo mapping.
+    Test simplified batching implementation for org-scoped breakdown.
     """
     s = _mk_stream()
 
-    # Force small batch size to exercise batching
-    monkeypatch.setenv("GITHUB_SEARCH_BATCH_SIZE", "2")
-
-    # Provide a fixed repo list
+    # Provide a fixed repo list  
     monkeypatch.setattr(s, "_list_repos_for_org", lambda api, org: [
         "r1", "r2", "r3", "r4", "r5"
     ])
@@ -345,14 +341,13 @@ def test_repo_breakdown_batches_issuecount(monkeypatch):
 
     monkeypatch.setattr(s, "_search_aggregate_count_batch", fake_batch)
     
-    # Mock the total count check (new optimization)
-    total_test_count = sum(counts_by_repo.values())  # 16, >1000 to trigger repo listing path
-    monkeypatch.setattr(s, "_search_aggregate_count", lambda q, api: 2000)  # Large count to trigger repo listing
+    # Mock total count to trigger repo listing path
+    monkeypatch.setattr(s, "_search_aggregate_count", lambda q, api: 2000)
 
     q = "org:Automattic is:issue created:2025-01-01..2025-01-31"
     out = s._search_with_repo_breakdown(q, "https://api.github.com")
 
-    # Zero counts are not included by implementation
+    # Zero counts are filtered out by simplified implementation
     assert out == {"r1": 5, "r3": 3, "r4": 7, "r5": 1}
 
 
@@ -371,3 +366,22 @@ def test_repo_scoped_fast_path_issuecount(monkeypatch):
     q = "repo:Automattic/calypso is:issue created:2025-02-01..2025-02-28"
     out = s._search_with_repo_breakdown(q, "https://api.github.com")
     assert out == {"calypso": 42}
+
+
+def test_graphql_variables_query_template():
+    """
+    Test that the essential GraphQL variables fix uses the correct template.
+    """
+    s = _mk_stream()
+    
+    # Verify GRAPHQL_SEARCH_COUNT_ONLY uses variables
+    assert "query SearchCount($q: String!)" in s.GRAPHQL_SEARCH_COUNT_ONLY
+    assert "search(query: $q" in s.GRAPHQL_SEARCH_COUNT_ONLY
+    assert "issueCount" in s.GRAPHQL_SEARCH_COUNT_ONLY
+
+
+def test_batch_size_constant():
+    """
+    Test that batching uses the defined constant.
+    """
+    assert BATCH_SIZE == 140
