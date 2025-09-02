@@ -17,7 +17,13 @@ from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 
 # Essential batching configuration
-BATCH_SIZE = 120
+BATCH_SIZE = 140
+NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
+
+# Regex patterns for query parsing
+ORG_PATTERN = re.compile(r"\borg:([^\s]+)")
+REPO_PATTERN = re.compile(r"\brepo:([^\s/]+)/([^\s]+)")  
+ORG_REPLACEMENT_PATTERN = re.compile(r"\borg:[^\s]+\s*")
 
 from tap_github_search.utils.date_utils import (
     get_last_complete_month,
@@ -52,6 +58,24 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _build_repo_query(self, org: str, repo: str, rest_query: str) -> str:
         """Build a repo-scoped search query."""
         return f"repo:{org}/{repo} {rest_query}".strip()
+
+    def _build_graphql_payload(self, query_template: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """Build a standardized GraphQL payload."""
+        return {"query": query_template, "variables": variables}
+
+    def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
+        """Make a GraphQL request with standardized payload building."""
+        payload = self._build_graphql_payload(query_template, variables)
+        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+        return self._request(prepared_request, None)
+
+    def _filter_active_repos(self, repos: list[dict[str, Any]]) -> list[str]:
+        """Filter out forks and archived repos, return list of active repo names."""
+        return [
+            repo["name"] 
+            for repo in repos 
+            if not repo.get("isFork", False) and not repo.get("isArchived", False)
+        ]
 
     @classmethod
     def _build_search_schema(cls) -> dict:
@@ -153,7 +177,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             if repo_breakdown:
                 repo_counts = self._search_with_repo_breakdown(query, api_url_base)
                 for repo, count in repo_counts.items():
-                    rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
+                    rest_query = ORG_REPLACEMENT_PATTERN.sub("", query).strip()
                     emitted_query = self._build_repo_query(org, repo, rest_query)
                     yield {
                         "search": search_name,
@@ -184,20 +208,20 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
         """Per-repo breakdown with simple batching optimization."""
         # Handle repo-scoped queries directly
-        repo_m = re.search(r"\brepo:([^\s/]+)/([^\s]+)", query)
+        repo_m = REPO_PATTERN.search(query)
         if repo_m:
             repo_name = repo_m.group(2).lower()
             count = self._search_aggregate_count(query, api_url_base)
             return {repo_name: count}
 
         # Handle org-scoped queries
-        org_m = re.search(r"\borg:([^\s]+)", query)
+        org_m = ORG_PATTERN.search(query)
         if not org_m:
             total_count = self._search_aggregate_count(query, api_url_base)
             return self._compute_repo_counts(query, api_url_base, total_count)
 
         org = org_m.group(1)
-        rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
+        rest_query = ORG_REPLACEMENT_PATTERN.sub("", query).strip()
         
         total_count = self._search_aggregate_count(query, api_url_base)
         
@@ -205,7 +229,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return {}
             
         # Use nodes approach for smaller result sets
-        if total_count <= 1000:
+        if total_count <= NODES_THRESHOLD:
             return self._get_repo_counts_from_nodes(query, api_url_base)
             
         # Use batching for larger result sets
@@ -264,9 +288,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         field_section = "\n  ".join(fields)
         doc = f"query RepoCounts({var_section}) {{\n  {field_section}\n}}"
         
-        payload = {"query": doc, "variables": variables}
-        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
-        response = self._request(prepared_request, None)
+        response = self._make_graphql_request(doc, variables, api_url_base)
         data = response.json().get("data", {})
         
         # Extract results in order
@@ -279,15 +301,13 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return results
 
     def _compute_repo_counts(self, query: str, api_url_base: str, total_count: int) -> dict[str, int]:
-        if total_count <= 1000:
+        if total_count <= NODES_THRESHOLD:
             return self._get_repo_counts_from_nodes(query, api_url_base)
         return self._search_with_auto_slicing(query, api_url_base)
 
     def _search_aggregate_count(self, query: str, api_url_base: str) -> int:
         """Essential GraphQL variables fix for comma-separated labels."""
-        payload = {"query": self.GRAPHQL_SEARCH_COUNT_ONLY, "variables": {"q": query}}
-        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
-        response = self._request(prepared_request, None)
+        response = self._make_graphql_request(self.GRAPHQL_SEARCH_COUNT_ONLY, {"q": query}, api_url_base)
         response_json = response.json()
         return response_json["data"]["search"]["issueCount"]
 
@@ -295,9 +315,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         repo_counts: Counter[str] = Counter()
         after = None
         while True:
-            payload = {"query": self.query, "variables": {"q": query, "after": after}}
-            prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
-            response = self._request(prepared_request, None)
+            response = self._make_graphql_request(self.query, {"q": query, "after": after}, api_url_base)
             response_json = response.json()
             search = response_json["data"]["search"]
             for node in search["nodes"]:
@@ -350,15 +368,12 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         after = None
         
         while True:
-            payload = {"query": query, "variables": {"org": org, "after": after}}
-            prepared = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
-            resp = self._request(prepared, None)
+            resp = self._make_graphql_request(query, {"org": org, "after": after}, api_url_base)
             data = resp.json()["data"]["organization"]["repositories"]
             
             # Filter out forks and archived repos
-            for repo in data["nodes"]:
-                if not repo.get("isFork", False) and not repo.get("isArchived", False):
-                    names.append(repo["name"])
+            active_repos = self._filter_active_repos(data["nodes"])
+            names.extend(active_repos)
             
             if not data["pageInfo"]["hasNextPage"]:
                 break
