@@ -130,6 +130,17 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         """
     )
 
+    GRAPHQL_SEARCH_COUNT_ONLY: ClassVar[str] = (
+        """
+        query SearchCount($q: String!) {
+          search(query: $q, type: ISSUE, first: 1) {
+            issueCount
+          }
+          rateLimit { cost remaining }
+        }
+        """
+    )
+
     @property
     def query(self) -> str:
         return self.GRAPHQL_SEARCH_WITH_REPOS
@@ -365,7 +376,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return self._search_with_auto_slicing(query, api_url_base)
 
     def _search_aggregate_count(self, query: str, api_url_base: str) -> int:
-        payload = {"query": self.query, "variables": {"q": query, "after": None}}
+        payload = {"query": self.GRAPHQL_SEARCH_COUNT_ONLY, "variables": {"q": query}}
         prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
         response = self._request(prepared_request, None)
         response_json = response.json()
