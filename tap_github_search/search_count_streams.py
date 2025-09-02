@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import calendar
 import re
-import time
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
@@ -19,11 +18,11 @@ from singer_sdk.helpers.types import Context
 from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 
-# Global search count cache to avoid re-running identical queries
-_SEARCH_CACHE: dict[str, int] = {}
-_SEARCH_CACHE_MAX_SIZE = 10000  # Limit cache size to prevent memory issues
+OPTIMAL_BATCH_SIZE = 140
+FALLBACK_BATCH_SIZE = 50
+HTTP_POOL_CONNECTIONS = 10
+HTTP_POOL_MAX_SIZE = 20
 
-# Global HTTP session with connection pooling
 _HTTP_SESSION: requests.Session | None = None
 
 def _get_http_session() -> requests.Session:
@@ -32,18 +31,16 @@ def _get_http_session() -> requests.Session:
     if _HTTP_SESSION is None:
         _HTTP_SESSION = requests.Session()
         
-        # Configure retry strategy
         retry_strategy = Retry(
             total=3,
             backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         
-        # Configure HTTP adapter with connection pooling
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
-            pool_connections=10,  # Number of connection pools to cache
-            pool_maxsize=20,     # Maximum number of connections to save in pool
+            pool_connections=HTTP_POOL_CONNECTIONS,
+            pool_maxsize=HTTP_POOL_MAX_SIZE,
         )
         
         _HTTP_SESSION.mount("https://", adapter)
@@ -80,12 +77,15 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         super().__init__(tap=tap, name=name or self.name, schema=schema or self.get_schema(), path=path)
 
     _authenticator: WrapperGitHubTokenAuthenticator | None = None
+    
+    def _build_repo_query(self, org: str, repo: str, rest_query: str) -> str:
+        """Build a repo-scoped search query."""
+        return f"repo:{org}/{repo} {rest_query}".strip()
 
     def _request(self, prepared_request, context):
         """Override to use global HTTP session with connection pooling."""
         session = _get_http_session()
         
-        # Apply authentication headers
         if self.authenticator:
             prepared_request.headers.update(self.authenticator.auth_headers or {})
             
@@ -95,7 +95,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return response
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 502:
-                # Log 502 error for batch size reduction
                 self.logger.warning(f"502 Bad Gateway error")
             raise
 
@@ -176,13 +175,10 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        start_time = time.time()
         now = datetime.utcnow().isoformat() + "Z"
         partitions_to_process = [context] if context else self.partitions
-        self.logger.info(f"Processing {len(partitions_to_process)} partitions")
         
         for i, partition in enumerate(partitions_to_process):
-            partition_start = time.time()
             org = partition["org"]
             month = partition["month"]
             query = partition["search_query"]
@@ -190,15 +186,12 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             repo_breakdown = partition.get("repo_breakdown", False)
             search_name = partition["search_name"]
             
-            self.logger.info(f"[{i+1}/{len(partitions_to_process)}] Processing {org} {month}")
 
             if repo_breakdown:
                 repo_counts = self._search_with_repo_breakdown(query, api_url_base)
                 for repo, count in repo_counts.items():
-                    # Keep API calls org-scoped, but emit a repo-scoped query for clarity in output
-                    # Replace any org:{org} token with repo:{org}/{repo} so the query is repo-only.
                     rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
-                    emitted_query = f"repo:{org}/{repo} {rest_query}".strip()
+                    emitted_query = self._build_repo_query(org, repo, rest_query)
                     yield {
                         "search": search_name,
                         "query": emitted_query,
@@ -225,67 +218,40 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                     "updated_at": now,
                 }
             
-            partition_time = time.time() - partition_start
-            self.logger.info(f"[{i+1}/{len(partitions_to_process)}] Completed {org} {month}")
         
-        total_time = time.time() - start_time
-        self.logger.info(f"Total processing time: {total_time:.1f}s")
 
     def _search_with_repo_breakdown(self, query: str, api_url_base: str) -> dict[str, int]:
         """
         Per-repo breakdown via aggregate counts: one search per repo using issueCount.
         """
-        start_time = time.time()
-        # Repo breakdown query processing
         
-        # If already repo-scoped, just return that repo's aggregate count.
         repo_m = re.search(r"\brepo:([^\s/]+)/([^\s]+)", query)
         if repo_m:
             repo_name = repo_m.group(2).lower()
             count = self._search_aggregate_count(query, api_url_base)
-            elapsed = time.time() - start_time
-            # Repo-scoped query completed
             return {repo_name: count}
 
-        # Expect an org-scoped query; fall back to legacy if not found.
         org_m = re.search(r"\borg:([^\s]+)", query)
         if not org_m:
             total_count = self._search_aggregate_count(query, api_url_base)
             result = self._compute_repo_counts(query, api_url_base, total_count)
-            elapsed = time.time() - start_time
-            # Non-org query completed
             return result
 
         org = org_m.group(1)
         rest_query = re.sub(r"\borg:[^\s]+\s*", "", query).strip()
         
-        # Optimization: Check total count first to decide strategy
-        count_start = time.time()
         total_count = self._search_aggregate_count(query, api_url_base)
-        count_time = time.time() - count_start
-        self.logger.info(f"Total count: {total_count} results")
         
         if total_count == 0:
-            elapsed = time.time() - start_time
-            # Zero results - early return
             return {}
             
-        # For small datasets, get repo names from search results (faster)
         if total_count <= 1000:
-            # Using nodes approach for small dataset
             result = self._get_repo_counts_from_nodes(query, api_url_base)
-            elapsed = time.time() - start_time
-            # Small dataset completed
             return result
             
-        # For large datasets, get all repos and batch query them
-        # Using repo batching for large dataset
         repos = self._list_repos_for_org(api_url_base, org)
-        self.logger.info(f"Found {len(repos)} total repos in org")
         
         result = self._get_repo_counts_via_batching(repos, org, rest_query, api_url_base)
-        elapsed = time.time() - start_time
-        # Large dataset completed
         return result
     
     def _prefilter_repos_with_results(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> tuple[list[str], dict[str, int]]:
@@ -293,64 +259,51 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if not repos:
             return [], {}
             
-        # Use optimized batch size balancing complexity vs batch count
-        prefilter_batch_size = 140
+        prefilter_batch_size = OPTIMAL_BATCH_SIZE
         active_repos = []
         repo_counts = {}
         total_batches = (len(repos) + prefilter_batch_size - 1) // prefilter_batch_size
         
-        # Pre-filtering repos with batch size optimization
         
         for batch_idx, i in enumerate(range(0, len(repos), prefilter_batch_size)):
             batch_repos = repos[i:i + prefilter_batch_size]
-            queries = [f"repo:{org}/{name} {rest_query}".strip() for name in batch_repos]
+            queries = [self._build_repo_query(org, name, rest_query) for name in batch_repos]
             
             try:
                 counts = self._search_aggregate_count_batch(queries, api_url_base)
-                # Keep repos with count > 0 AND preserve their counts
-                batch_active = 0
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:
                         active_repos.append(repo_name)
-                        repo_counts[repo_name] = count  # NEW: save the count
-                        batch_active += 1
-                # Batch processing completed
+                        repo_counts[repo_name] = count
+                    else:
+                        repo_counts[repo_name] = 0
             except requests.exceptions.HTTPError as e:
                 if e.response and e.response.status_code == 502:
-                    # Simple 502 fallback: retry with smaller batches
                     self.logger.warning(f"502 Bad Gateway - retrying with smaller batch size")
                     
-                    # Split into batches of 50 and retry
                     batch_results = []
-                    for j in range(0, len(batch_repos), 50):
-                        small_batch = batch_repos[j:j + 50]
-                        small_queries = [f"repo:{org}/{name} {rest_query}".strip() for name in small_batch]
+                    for j in range(0, len(batch_repos), FALLBACK_BATCH_SIZE):
+                        small_batch = batch_repos[j:j + FALLBACK_BATCH_SIZE]
+                        small_queries = [self._build_repo_query(org, name, rest_query) for name in small_batch]
                         try:
                             small_counts = self._search_aggregate_count_batch(small_queries, api_url_base)
                             batch_results.extend(list(zip(small_batch, small_counts)))
                         except Exception:
-                            # If small batch fails, include with zero counts
                             batch_results.extend([(name, 0) for name in small_batch])
                     
-                    # Process results
-                    batch_active = 0
                     for repo_name, count in batch_results:
                         if count > 0:
                             active_repos.append(repo_name)
                             repo_counts[repo_name] = count
-                            batch_active += 1
                         else:
                             repo_counts[repo_name] = 0
-                    # Retry batch completed
                 else:
                     self.logger.warning(f"Pre-filter batch failed: {str(e)}")
-                    # On other errors, include all repos but with zero counts as fallback
                     for repo_name in batch_repos:
                         active_repos.append(repo_name)
                         repo_counts[repo_name] = 0
             except Exception as e:
                 self.logger.warning(f"Pre-filter batch failed: {str(e)}")
-                # On error, include all repos but with zero counts as fallback
                 for repo_name in batch_repos:
                     active_repos.append(repo_name)
                     repo_counts[repo_name] = 0
@@ -359,26 +312,17 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             
     def _get_repo_counts_via_batching(self, repos: list[str], org: str, rest_query: str, api_url_base: str) -> dict[str, int]:
         """Helper method for batched repo count fetching - now uses pre-filtering results directly."""
-        start_time = time.time()
         if not repos:
             return {}
         
-        # Pre-filter and get counts in one pass - no duplicate queries!
-        prefilter_start = time.time()
         active_repos, counts = self._prefilter_repos_with_results(repos, org, rest_query, api_url_base)
-        prefilter_time = time.time() - prefilter_start
         
         if not active_repos:
             return {}, {}
             return {}
             
-        self.logger.info(f"Pre-filtered from {len(repos)} to {len(active_repos)} repos with results")
         
-        # No final batching needed - we already have the counts!
-        elapsed = time.time() - start_time
         total_results = len([c for c in counts.values() if c > 0])
-        # Using pre-filter counts directly
-        # Batching completed
         return counts
 
     def _search_aggregate_count_batch(self, queries: list[str], api_url_base: str) -> list[int]:
@@ -389,31 +333,10 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if not queries:
             return []
             
-        # Check cache first and separate cached from uncached queries
-        results: list[int] = [0] * len(queries)
-        uncached_queries = []
-        uncached_indices = []
-        cache_hits = 0
-        
-        for idx, query in enumerate(queries):
-            cache_key = f"{api_url_base}:{query}"
-            if cache_key in _SEARCH_CACHE:
-                results[idx] = _SEARCH_CACHE[cache_key]
-                cache_hits += 1
-            else:
-                uncached_queries.append(query)
-                uncached_indices.append(idx)
-        
-        
-        # If all queries are cached, return early
-        if not uncached_queries:
-            return results
-            
-        # Build GraphQL for uncached queries only
         var_defs = []
         fields = []
         variables: dict[str, str] = {}
-        for batch_idx, query in enumerate(uncached_queries):
+        for batch_idx, query in enumerate(queries):
             var_name = f"q{batch_idx}"
             alias = f"a{batch_idx}"
             var_defs.append(f"${var_name}: String!")
@@ -428,16 +351,11 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         response = self._request(prepared_request, None)
         data = response.json().get("data", {})
         
-        # Process results and update cache
-        for batch_idx, (query, original_idx) in enumerate(zip(uncached_queries, uncached_indices)):
+        results = []
+        for batch_idx, query in enumerate(queries):
             alias = f"a{batch_idx}"
             count = int(data.get(alias, {}).get("issueCount", 0))
-            results[original_idx] = count
-            # Cache the result
-            cache_key = f"{api_url_base}:{query}"
-            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX_SIZE:
-                _SEARCH_CACHE.clear()  # Simple cache reset when full
-            _SEARCH_CACHE[cache_key] = count
+            results.append(count)
             
         return results
 
@@ -501,8 +419,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return dict(repo_counts)
 
     def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
-        start_time = time.time()
-        # Fetching repo list
         
         q = (
             """
@@ -527,18 +443,15 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         page_count = 0
         total_excluded = {"forks": 0, "archived": 0, "mirrors": 0, "templates": 0}
         while True:
-            page_start = time.time()
             payload = {"query": q, "variables": {"org": org, "after": after}}
             prepared = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
             resp = self._request(prepared, None)
             data = resp.json()["data"]["organization"]["repositories"]
-            # Filter out unwanted repositories
             all_page_repos = data["nodes"]
             filtered_repos = []
             excluded_count = {"forks": 0, "archived": 0, "mirrors": 0, "templates": 0}
             
             for repo in all_page_repos:
-                # Skip if it's a fork, archived, mirror, or template
                 if repo.get("isFork", False):
                     excluded_count["forks"] += 1
                 elif repo.get("isArchived", False):
@@ -552,9 +465,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             
             names.extend(filtered_repos)
             page_count += 1
-            page_time = time.time() - page_start
             
-            # Accumulate total excluded counts
             for key in total_excluded:
                 total_excluded[key] += excluded_count[key]
             
@@ -564,10 +475,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 break
             after = data["pageInfo"]["endCursor"]
             
-        elapsed = time.time() - start_time
         total_excluded_count = sum(total_excluded.values())
-        self.logger.info(f"Found {len(names)} active repos ({total_excluded_count} excluded)")
-        # Repository caching removed for weekly runs
         return names
 
 
@@ -587,7 +495,6 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         return self.query_template.format(org=org, start=start_date, end=end_date)
 
     def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, stream_type: str) -> str:
-        # For repo-specific queries, use full repo name in place of {org}
         return self.query_template.format(org=repo, start=start_date, end=end_date)
 
     @property
