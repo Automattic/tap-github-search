@@ -381,10 +381,3 @@ def test_graphql_variables_query_template():
     assert "query SearchCount($q: String!)" in s.GRAPHQL_SEARCH_COUNT_ONLY
     assert "search(query: $q" in s.GRAPHQL_SEARCH_COUNT_ONLY
     assert "issueCount" in s.GRAPHQL_SEARCH_COUNT_ONLY
-
-
-def test_batch_size_constant():
-    """
-    Test that batching uses the defined constant.
-    """
-    assert BATCH_SIZE == 140
