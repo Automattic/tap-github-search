@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import date
 import os
+import types
 import logging
 from unittest.mock import Mock, patch
 import pytest
+import requests
 
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
@@ -179,6 +181,7 @@ def test_configurable_stream_partitions_with_orgs():
     }
     mock_tap = Mock()
     mock_tap.config = {}
+    mock_tap.state = {}
     
     search_config = {
         "search": {
@@ -210,6 +213,7 @@ def test_configurable_stream_partitions_with_repos():
     }
     mock_tap = Mock()
     mock_tap.config = {}
+    mock_tap.state = {}
     
     search_config = {
         "search": {
@@ -274,7 +278,6 @@ def _mk_stream():
     return SearchCountStreamBase(tap=_DummyTap(), name="test", schema=None, path=None)
 
 
-@pytest.mark.skip(reason="created<=END -closed:<START fan-out not implemented; slicer unchanged")
 def test_range_passthrough(monkeypatch):
     """
     For queries already containing created:START..END, we expect direct RANGE handling

@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
+import requests
 import json
 from collections import Counter
 
@@ -143,15 +144,11 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         return []
 
     def _get_bookmark_for_context(self, context: dict) -> str | None:
-        try:
-            stream_state = self.tap.state.get("bookmarks", {}).get(self.name, {})
-            for partition_state in stream_state.get("partitions", []):
-                state_context = partition_state.get("context", {})
-                if state_context.get("org") == context.get("org") and state_context.get("repo") == context.get("repo"):
-                    return partition_state.get("replication_key_value")
-            return None
-        except Exception:
-            return None
+        stream_state = self.tap.state.get("bookmarks", {}).get(self.name, {})
+        for partition_state in stream_state.get("partitions", []):
+            state_context = partition_state.get("context", {})
+            if state_context.get("org") == context.get("org") and state_context.get("repo") == context.get("repo"):
+                return partition_state.get("replication_key_value")
 
     def _should_include_month(self, month_str: str, bookmark_date: date | None) -> bool:
         month_date = month_to_date(month_str)
@@ -253,18 +250,15 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:  # Only include repos with results
                         repo_counts[repo_name] = count
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 self.logger.warning(f"Batch failed, falling back to individual queries: {str(e)}")
                 # Fallback to individual queries
                 for repo in batch_repos:
-                    try:
-                        query = self._build_repo_query(org, repo, rest_query)
-                        count = self._search_aggregate_count(query, api_url_base)
-                        if count > 0:
-                            repo_counts[repo] = count
-                    except Exception:
-                        continue
-                
+                    query = self._build_repo_query(org, repo, rest_query)
+                    count = self._search_aggregate_count(query, api_url_base)
+                    if count > 0:
+                        repo_counts[repo] = count
+                    
         return repo_counts
 
     def _search_aggregate_count_batch(self, queries: list[str], api_url_base: str) -> list[int]:
@@ -484,12 +478,7 @@ def _decode_search_config(tap) -> dict | None:
     """Simple configuration loading from environment variable."""
     search_json = os.getenv("TAP_GITHUB_SEARCH_STATS_SEARCH")
     if search_json:
-        try:
-            return json.loads(search_json)
-        except Exception as e:
-            tap.logger.warning(f"Failed to parse search config JSON: {e}")
-    
-    return None
+        return json.loads(search_json)
 
 
 def create_configurable_streams(tap, config_override: dict | None = None) -> list:
