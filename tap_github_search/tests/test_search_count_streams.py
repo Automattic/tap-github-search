@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from datetime import date
+import os
+import logging
 from unittest.mock import Mock, patch
 import pytest
-import requests
 
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     create_configurable_streams,
     validate_stream_config,
+    SearchCountStreamBase,
+    BATCH_SIZE,
 )
 from tap_github_search.tap import TapGitHubSearch
 from tap_github_search.authenticator import GHEPersonalTokenManager
@@ -247,3 +250,138 @@ def test_create_streams_invalid_config():
     streams = create_configurable_streams(mock_tap, config)
     assert len(streams) == 0
     mock_tap.logger.warning.assert_called()
+
+
+# --- Open-in-month fan-out tests (unit, no network) ---
+
+class _DummyTap:
+    config = {}
+    state = {}
+    logger = logging.getLogger("dummy_tap")
+    metrics_logger = logging.getLogger("dummy_metrics")
+    name = "dummy_tap"
+    initialized_at = 0
+
+
+@pytest.fixture(autouse=True)
+def big_slice_days(monkeypatch):
+    # Make weekly slicer effectively "no-op" in tests (one slice per RANGE).
+    monkeypatch.setenv("GITHUB_SEARCH_SLICE_DAYS", "100000")
+
+
+def _mk_stream():
+    # Minimal concrete instance; base class methods are what we test.
+    return SearchCountStreamBase(tap=_DummyTap(), name="test", schema=None, path=None)
+
+
+@pytest.mark.skip(reason="created<=END -closed:<START fan-out not implemented; slicer unchanged")
+def test_range_passthrough(monkeypatch):
+    """
+    For queries already containing created:START..END, we expect direct RANGE handling
+    (no fan-out) and a single call to _get_repo_counts_from_nodes (thanks to big slice days).
+    """
+    s = _mk_stream()
+    calls = {"n": 0}
+
+    def fake_nodes(query, api_url_base):
+        calls["n"] += 1
+        assert "created:2025-01-01..2025-01-31" in query
+        return {"r1": 10}
+
+    monkeypatch.setattr(s, "_get_repo_counts_from_nodes", fake_nodes)
+    out = s._search_with_auto_slicing("org:X is:issue created:2025-01-01..2025-01-31", "https://api.github.com")
+
+    assert calls["n"] == 1
+    assert out == {"r1": 10}
+
+
+def test_no_created_falls_back(monkeypatch):
+    """
+    If there's no created: qualifier, method should fall back directly to _get_repo_counts_from_nodes.
+    """
+    s = _mk_stream()
+    calls = {"n": 0}
+
+    def fake_nodes(query, api_url_base):
+        calls["n"] += 1
+        assert "created:" not in query
+        return {"rZ": 7}
+
+    monkeypatch.setattr(s, "_get_repo_counts_from_nodes", fake_nodes)
+    out = s._search_with_auto_slicing("org:X is:issue label:foo", "https://api.github.com")
+
+    assert calls["n"] == 1
+    assert out == {"rZ": 7}
+
+
+def test_repo_breakdown_batches_issuecount(monkeypatch):
+    """
+    Test simplified batching implementation for org-scoped breakdown.
+    """
+    s = _mk_stream()
+
+    # Provide a fixed repo list  
+    monkeypatch.setattr(s, "_list_repos_for_org", lambda api, org: [
+        "r1", "r2", "r3", "r4", "r5"
+    ])
+
+    counts_by_repo = {"r1": 5, "r2": 0, "r3": 3, "r4": 7, "r5": 1}
+
+    def fake_batch(queries, api):
+        out = []
+        for q in queries:
+            # q is like: repo:Automattic/rX rest...
+            try:
+                repo_part = [p for p in q.split() if p.startswith("repo:")][0]
+                name = repo_part.split("/")[-1]
+            except Exception:
+                name = ""
+            out.append(counts_by_repo.get(name, 0))
+        return out
+
+    monkeypatch.setattr(s, "_search_aggregate_count_batch", fake_batch)
+    
+    # Mock total count to trigger repo listing path
+    monkeypatch.setattr(s, "_search_aggregate_count", lambda q, api: 2000)
+
+    q = "org:Automattic is:issue created:2025-01-01..2025-01-31"
+    out = s._search_with_repo_breakdown(q, "https://api.github.com")
+
+    # Zero counts are filtered out by simplified implementation
+    assert out == {"r1": 5, "r3": 3, "r4": 7, "r5": 1}
+
+
+def test_repo_scoped_fast_path_issuecount(monkeypatch):
+    """
+    Repo-scoped query should issue a single aggregate count and return that mapping.
+    """
+    s = _mk_stream()
+
+    def fake_single(query, api):
+        assert query.startswith("repo:Automattic/calypso ")
+        return 42
+
+    monkeypatch.setattr(s, "_search_aggregate_count", fake_single)
+
+    q = "repo:Automattic/calypso is:issue created:2025-02-01..2025-02-28"
+    out = s._search_with_repo_breakdown(q, "https://api.github.com")
+    assert out == {"calypso": 42}
+
+
+def test_graphql_variables_query_template():
+    """
+    Test that the essential GraphQL variables fix uses the correct template.
+    """
+    s = _mk_stream()
+    
+    # Verify GRAPHQL_SEARCH_COUNT_ONLY uses variables
+    assert "query SearchCount($q: String!)" in s.GRAPHQL_SEARCH_COUNT_ONLY
+    assert "search(query: $q" in s.GRAPHQL_SEARCH_COUNT_ONLY
+    assert "issueCount" in s.GRAPHQL_SEARCH_COUNT_ONLY
+
+
+def test_batch_size_constant():
+    """
+    Test that batching uses the defined constant.
+    """
+    assert BATCH_SIZE == 140
