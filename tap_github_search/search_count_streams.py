@@ -7,6 +7,7 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
+import requests
 import json
 from collections import Counter
 
@@ -249,7 +250,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:  # Only include repos with results
                         repo_counts[repo_name] = count
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 self.logger.warning(f"Batch failed, falling back to individual queries: {str(e)}")
                 # Fallback to individual queries
                 for repo in batch_repos:
