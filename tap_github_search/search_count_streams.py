@@ -239,6 +239,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return {}
         
         repo_counts = {}
+        # Debug: report effective batch size and total repos
+        self.logger.info(f"Search batching: batch_size={BATCH_SIZE}, total_repos={len(repos)}")
         
         # Process repos in batches
         for i in range(0, len(repos), BATCH_SIZE):
