@@ -278,7 +278,6 @@ def _mk_stream():
     return SearchCountStreamBase(tap=_DummyTap(), name="test", schema=None, path=None)
 
 
-@pytest.mark.skip(reason="created<=END -closed:<START fan-out not implemented; slicer unchanged")
 def test_range_passthrough(monkeypatch):
     """
     For queries already containing created:START..END, we expect direct RANGE handling
