@@ -18,7 +18,7 @@ from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 
 # Essential batching configuration
-BATCH_SIZE = int(os.environ.get("GITHUB_SEARCH_BATCH_SIZE", "140"))
+BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_STATS_BATCH_SIZE", "100"))
 NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
 
 # Regex patterns for query parsing
@@ -239,7 +239,6 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return {}
         
         repo_counts = {}
-        # Debug: report effective batch size and total repos
         self.logger.info(f"Search batching: batch_size={BATCH_SIZE}, total_repos={len(repos)}")
         
         # Process repos in batches
