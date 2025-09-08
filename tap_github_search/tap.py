@@ -15,18 +15,18 @@ class TapGitHubSearch(TapGitHub):
 
     def discover_streams(self) -> list[Stream]:
         search_cfg_b64 = os.environ.get("TAP_GITHUB_SEARCH_CONFIG_B64")
-        search_cfg = os.environ.get("GITHUB_SEARCH_CONFIG")
+        search_cfg = os.environ.get("TAP_GITHUB_SEARCH_CONFIG")
         
         # Ensure both env vars aren't set simultaneously
         if search_cfg_b64 and search_cfg:
-            raise ValueError("Both TAP_GITHUB_SEARCH_CONFIG_B64 and GITHUB_SEARCH_CONFIG are set. Please use only one.")
+            raise ValueError("Both TAP_GITHUB_SEARCH_CONFIG_B64 and TAP_GITHUB_SEARCH_CONFIG are set. Please use only one.")
         
         if search_cfg_b64:
             search_cfg = base64.b64decode(search_cfg_b64).decode("utf-8")
             self.logger.debug(f"Decoded TAP_GITHUB_SEARCH_CONFIG_B64: {search_cfg}")
         
         if not search_cfg and "search" not in self.config:
-            raise ValueError("Provide search.* in config, set GITHUB_SEARCH_CONFIG, or set TAP_GITHUB_SEARCH_CONFIG_B64.")
+            raise ValueError("Provide search.* in config, set TAP_GITHUB_SEARCH_CONFIG, or set TAP_GITHUB_SEARCH_CONFIG_B64.")
 
         cfg = dict(self.config)
         if "search" not in cfg and search_cfg:
