@@ -19,13 +19,13 @@ class TapGitHubSearch(TapGitHub):
         
         # Ensure both env vars aren't set simultaneously
         if search_cfg_b64 and search_cfg:
-            raise ValueError("Both TAP_GITHUB_SEARCH_CONFIG_B64 and TAP_GITHUB_SEARCH_CONFIG are set. Please use only one.")
+            raise ValueError("Both TAP_GITHUB_SEARCH_CONFIG and TAP_GITHUB_SEARCH_CONFIG_B64 are set. Please use only one.")
         
         if search_cfg_b64:
             search_cfg = base64.b64decode(search_cfg_b64).decode("utf-8")
             self.logger.debug(f"Decoded TAP_GITHUB_SEARCH_CONFIG_B64: {search_cfg}")
         
-        if not search_cfg and "search" not in self.config:
+        if not search_cfg and not search_cfg_b64 and "search" not in self.config:
             raise ValueError("Provide search.* in config, set TAP_GITHUB_SEARCH_CONFIG, or set TAP_GITHUB_SEARCH_CONFIG_B64.")
 
         cfg = dict(self.config)
