@@ -477,7 +477,7 @@ def validate_stream_config(stream_config: dict) -> list[str]:
 
 def _decode_search_config(tap) -> dict | None:
     """Simple configuration loading from environment variable."""
-    search_json = os.getenv("TAP_GITHUB_SEARCH_SEARCH")
+    search_json = os.getenv("TAP_GITHUB_SEARCH_CONFIG")
     if search_json:
         return json.loads(search_json)
 
