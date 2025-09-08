@@ -18,7 +18,7 @@ from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 
 # Essential batching configuration
-BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_STATS_BATCH_SIZE", "100"))
+BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_BATCH_SIZE", "100"))
 NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
 
 # Regex patterns for query parsing
@@ -477,7 +477,7 @@ def validate_stream_config(stream_config: dict) -> list[str]:
 
 def _decode_search_config(tap) -> dict | None:
     """Simple configuration loading from environment variable."""
-    search_json = os.getenv("TAP_GITHUB_SEARCH_STATS_SEARCH")
+    search_json = os.getenv("TAP_GITHUB_SEARCH_SEARCH")
     if search_json:
         return json.loads(search_json)
 
