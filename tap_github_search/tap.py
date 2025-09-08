@@ -1,4 +1,5 @@
 from __future__ import annotations
+import base64
 import json
 import os
 from singer_sdk import Stream
@@ -13,9 +14,17 @@ class TapGitHubSearch(TapGitHub):
     name = "tap-github-search"
 
     def discover_streams(self) -> list[Stream]:
+        search_cfg_b64 = os.environ.get("TAP_GITHUB_SEARCH_STATS_SEARCH_B64")
         search_cfg = os.environ.get("GITHUB_SEARCH_CONFIG")
+        
+        if search_cfg_b64:
+            try:
+                search_cfg = base64.b64decode(search_cfg_b64).decode("utf-8")
+            except Exception as e:
+                raise ValueError(f"Failed to decode TAP_GITHUB_SEARCH_STATS_SEARCH_B64: {e}")
+        
         if not search_cfg and "search" not in self.config:
-            raise ValueError("Provide search.* in config or set GITHUB_SEARCH_CONFIG.")
+            raise ValueError("Provide search.* in config, set GITHUB_SEARCH_CONFIG, or set TAP_GITHUB_SEARCH_STATS_SEARCH_B64.")
 
         cfg = dict(self.config)
         if "search" not in cfg and search_cfg:
