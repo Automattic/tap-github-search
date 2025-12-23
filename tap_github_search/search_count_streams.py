@@ -68,7 +68,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         """Make a GraphQL request with standardized payload building."""
         payload = self._build_graphql_payload(query_template, variables)
         prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
-        return self._request(prepared_request, None)
+        decorated_request = self.request_decorator(self._request)
+        return decorated_request(prepared_request, None)
 
     def _filter_active_repos(self, repos: list[dict[str, Any]]) -> list[str]:
         """Filter out forks and archived repos, return list of active repo names."""
