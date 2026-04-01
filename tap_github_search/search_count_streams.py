@@ -67,7 +67,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
         """Make a GraphQL request with standardized payload building."""
         payload = self._build_graphql_payload(query_template, variables)
-        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+        graphql_base = api_url_base.rstrip("/").removesuffix("/v3")
+        prepared_request = self.build_prepared_request(method="POST", url=f"{graphql_base}/graphql", json=payload)
         decorated_request = self.request_decorator(self._request)
         return decorated_request(prepared_request, None)
 
@@ -315,6 +316,8 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             response_json = response.json()
             search = response_json["data"]["search"]
             for node in search["nodes"]:
+                if not node or not node.get("repository"):
+                    continue
                 repo_name = node["repository"]["name"]
                 repo_counts.update([repo_name])
             if not search["pageInfo"]["hasNextPage"]:

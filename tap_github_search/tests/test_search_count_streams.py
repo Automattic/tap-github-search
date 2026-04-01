@@ -76,7 +76,7 @@ def test_ghe_token_validation_success(mock_get):
     assert manager.is_valid_token() == True
     
     mock_get.assert_called_once_with(
-        url="https://github.enterprise.com/api/v3/rate_limit",
+        url="https://github.enterprise.com/api/v3/user",
         headers={"Authorization": "token token123"}
     )
 

@@ -22,7 +22,7 @@ class GHEPersonalTokenManager(TokenManager):
             return False
         try:
             response = requests.get(
-                url=f"{self.api_base_url}/rate_limit",
+                url=f"{self.api_base_url}/user",
                 headers={"Authorization": f"token {self.token}"},
             )
             response.raise_for_status()
@@ -46,7 +46,7 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
     """Authenticator that validates tokens against the configured API base URL.
 
     This avoids rejecting valid GitHub Enterprise tokens by checking
-    the instance's own /rate_limit endpoint instead of api.github.com.
+    the instance's own /user endpoint instead of api.github.com.
     """
 
     def __init__(self, stream) -> None:  # noqa: ANN001
