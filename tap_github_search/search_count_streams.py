@@ -328,7 +328,9 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if skipped:
             self.logger.warning("Skipped %d null/inaccessible node(s) in search results for query: %s", skipped, query)
         if not repo_counts and skipped:
-            self.logger.error("All %d node(s) were skipped for query: %s — token may lack repo access", skipped, query)
+            raise RuntimeError(
+                f"All {skipped} node(s) were skipped for query: {query} -- token may lack repo access"
+            )
         return dict(repo_counts)
 
     def _search_with_auto_slicing(self, query: str, api_url_base: str) -> dict[str, int]:
