@@ -76,7 +76,7 @@ def test_ghe_token_validation_success(mock_get):
     assert manager.is_valid_token() == True
     
     mock_get.assert_called_once_with(
-        url="https://github.enterprise.com/api/v3/rate_limit",
+        url="https://github.enterprise.com/api/v3/user",
         headers={"Authorization": "token token123"}
     )
 
@@ -371,13 +371,48 @@ def test_repo_scoped_fast_path_issuecount(monkeypatch):
     assert out == {"calypso": 42}
 
 
-def test_graphql_variables_query_template():
-    """
-    Test that the essential GraphQL variables fix uses the correct template.
-    """
+@pytest.mark.parametrize("api_url_base,expected_url", [
+    ("https://github.enterprise.com/api/v3", "https://github.enterprise.com/api/graphql"),
+    ("https://api.github.com", "https://api.github.com/graphql"),
+    ("https://github.enterprise.com/api/v3/", "https://github.enterprise.com/api/graphql"),
+])
+def test_graphql_url_strips_v3_for_ghes(monkeypatch, api_url_base, expected_url):
     s = _mk_stream()
-    
-    # Verify GRAPHQL_SEARCH_COUNT_ONLY uses variables
-    assert "query SearchCount($q: String!)" in s.GRAPHQL_SEARCH_COUNT_ONLY
-    assert "search(query: $q" in s.GRAPHQL_SEARCH_COUNT_ONLY
-    assert "issueCount" in s.GRAPHQL_SEARCH_COUNT_ONLY
+    captured = {}
+
+    def fake_build_request(method, url, **kwargs):
+        captured["url"] = url
+        return Mock()
+
+    monkeypatch.setattr(s, "build_prepared_request", fake_build_request)
+    monkeypatch.setattr(s, "request_decorator", lambda fn: lambda req, ctx: Mock())
+
+    s._make_graphql_request("query { viewer { login } }", {}, api_url_base)
+    assert captured["url"] == expected_url
+
+
+def test_null_nodes_skipped_in_repo_counts(monkeypatch):
+    s = _mk_stream()
+
+    response_json = {
+        "data": {
+            "search": {
+                "nodes": [
+                    None,
+                    {"repository": {"name": "foo"}},
+                    {"repository": None},
+                    {"repository": {"name": "bar"}},
+                    {"repository": {"name": "foo"}},
+                ],
+                "pageInfo": {"hasNextPage": False},
+            }
+        }
+    }
+
+    mock_response = Mock()
+    mock_response.json.return_value = response_json
+
+    monkeypatch.setattr(s, "_make_graphql_request", lambda *args: mock_response)
+
+    result = s._get_repo_counts_from_nodes("org:Test type:pr", "https://api.github.com")
+    assert result == {"foo": 2, "bar": 1}

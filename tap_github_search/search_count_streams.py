@@ -67,16 +67,17 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
         """Make a GraphQL request with standardized payload building."""
         payload = self._build_graphql_payload(query_template, variables)
-        prepared_request = self.build_prepared_request(method="POST", url=f"{api_url_base}/graphql", json=payload)
+        graphql_base = api_url_base.rstrip("/").removesuffix("/v3")
+        prepared_request = self.build_prepared_request(method="POST", url=f"{graphql_base}/graphql", json=payload)
         decorated_request = self.request_decorator(self._request)
         return decorated_request(prepared_request, None)
 
     def _filter_active_repos(self, repos: list[dict[str, Any]]) -> list[str]:
         """Filter out forks and archived repos, return list of active repo names."""
         return [
-            repo["name"] 
-            for repo in repos 
-            if not repo.get("isFork", False) and not repo.get("isArchived", False)
+            repo["name"]
+            for repo in repos
+            if repo and not repo.get("isFork", False) and not repo.get("isArchived", False)
         ]
 
     @classmethod
@@ -310,16 +311,26 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _get_repo_counts_from_nodes(self, query: str, api_url_base: str) -> dict[str, int]:
         repo_counts: Counter[str] = Counter()
         after = None
+        skipped = 0
         while True:
             response = self._make_graphql_request(self.query, {"q": query, "after": after}, api_url_base)
             response_json = response.json()
             search = response_json["data"]["search"]
             for node in search["nodes"]:
+                if not node or not node.get("repository"):
+                    skipped += 1
+                    continue
                 repo_name = node["repository"]["name"]
                 repo_counts.update([repo_name])
             if not search["pageInfo"]["hasNextPage"]:
                 break
             after = search["pageInfo"]["endCursor"]
+        if skipped:
+            self.logger.warning("Skipped %d null/inaccessible node(s) in search results for query: %s", skipped, query)
+        if not repo_counts and skipped:
+            raise RuntimeError(
+                f"All {skipped} node(s) were skipped for query: {query} -- token may lack repo access"
+            )
         return dict(repo_counts)
 
     def _search_with_auto_slicing(self, query: str, api_url_base: str) -> dict[str, int]:
