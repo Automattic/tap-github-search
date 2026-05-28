@@ -471,6 +471,250 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         return partitions
 
 
+def _instance_from_api_base(api_url_base: str) -> str:
+    base = (api_url_base or "").lower()
+    if "github.a8c.com" in base:
+        return "a8c_ghe"
+    if "github.tumblr.net" in base:
+        return "tumblr_ghe"
+    if "api.github.com" in base or "github.com" in base:
+        return "github_com"
+    return "unknown"
+
+
+CLOSED_RANGE_RE = re.compile(r"closed:\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}")
+CLOSED_CAPTURE_RE = re.compile(r"closed:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
+
+
+def _hours_between(created: str | None, closed: str | None) -> float | None:
+    if not created or not closed:
+        return None
+    c0 = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    c1 = datetime.fromisoformat(closed.replace("Z", "+00:00"))
+    return round((c1 - c0).total_seconds() / 3600.0, 4)
+
+
+class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
+    """Per-PR velocity stream: one row per closed PR with timing + AI cohort flags.
+
+    Reuses the count stream's transport, auth, monthly partitioning and _search_cfg
+    injection; overrides the schema and get_records to emit per-PR rows. The base
+    is:closed query is day-sliced to stay under the 1000-result search cap, and AI
+    membership is folded into is_ai_authored / is_ai_reviewed booleans before emit.
+    """
+
+    replication_method: ClassVar[str] = "FULL_TABLE"
+    replication_key = None
+    primary_keys: ClassVar[list[str]] = ["instance", "org", "repo", "pr_number"]
+    state_partitioning_keys: ClassVar[list[str]] = []
+
+    GRAPHQL_PR_VELOCITY: ClassVar[str] = """
+    query PrVelocity($q: String!, $after: String) {
+      search(query: $q, type: ISSUE, first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          ... on PullRequest {
+            number title url state isDraft
+            createdAt closedAt mergedAt updatedAt
+            author { login }
+            mergedBy { login }
+            repository { name nameWithOwner }
+            baseRefName headRefName
+            additions deletions changedFiles
+            reviewDecision
+            comments { totalCount }
+            reviews { totalCount }
+            commits { totalCount }
+            labels(first: 10) { nodes { name } }
+          }
+        }
+      }
+      rateLimit { cost remaining }
+    }
+    """
+
+    GRAPHQL_PR_IDS: ClassVar[str] = """
+    query PrIds($q: String!, $after: String) {
+      search(query: $q, type: ISSUE, first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ... on PullRequest { number repository { nameWithOwner } } }
+      }
+      rateLimit { cost remaining }
+    }
+    """
+
+    def __init__(self, stream_config: dict, tap):
+        self.stream_config = stream_config
+        self.query_template = stream_config["query_template"]
+        self.stream_description = stream_config.get("description", f"PR velocity stream: {stream_config['name']}")
+        self.name = stream_config["name"]
+        self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
+        self.tap = tap
+        # Skip ConfigurableSearchCountStream.__init__ (it forces the *_search_counts name + count schema).
+        SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
+
+    @classmethod
+    def get_schema(cls) -> dict:
+        return th.PropertiesList(
+            th.Property("instance", th.StringType, required=True),
+            th.Property("org", th.StringType, required=True),
+            th.Property("repo", th.StringType, required=True),
+            th.Property("pr_number", th.IntegerType, required=True),
+            th.Property("title", th.StringType),
+            th.Property("url", th.StringType),
+            th.Property("author_login", th.StringType),
+            th.Property("created_at", th.DateTimeType),
+            th.Property("merged_at", th.DateTimeType),
+            th.Property("closed_at", th.DateTimeType),
+            th.Property("updated_at", th.DateTimeType),
+            th.Property("hours_to_close", th.NumberType),
+            th.Property("outcome", th.StringType),
+            th.Property("state", th.StringType),
+            th.Property("is_draft", th.BooleanType),
+            th.Property("merged_by_login", th.StringType),
+            th.Property("base_ref", th.StringType),
+            th.Property("head_ref", th.StringType),
+            th.Property("additions", th.IntegerType),
+            th.Property("deletions", th.IntegerType),
+            th.Property("changed_files", th.IntegerType),
+            th.Property("review_decision", th.StringType),
+            th.Property("comment_count", th.IntegerType),
+            th.Property("review_count", th.IntegerType),
+            th.Property("commit_count", th.IntegerType),
+            th.Property("label_names", th.ArrayType(th.StringType)),
+            th.Property("is_ai_authored", th.BooleanType),
+            th.Property("is_ai_reviewed", th.BooleanType),
+            th.Property("month", th.StringType),
+            th.Property("synced_at", th.DateTimeType),
+        ).to_dict()
+
+    def _scope(self) -> dict:
+        cfg_source = getattr(self, "_search_cfg", None) or self.config
+        return cfg_source.get("search", {}).get("scope", {})
+
+    def _iter_pr_nodes(self, query: str, api_url_base: str):
+        after = None
+        skipped = 0
+        seen_any = False
+        while True:
+            resp = self._make_graphql_request(self.GRAPHQL_PR_VELOCITY, {"q": query, "after": after}, api_url_base)
+            search = resp.json()["data"]["search"]
+            for node in search["nodes"]:
+                if not node or node.get("number") is None or not node.get("repository"):
+                    skipped += 1
+                    continue
+                seen_any = True
+                yield node
+            if not search["pageInfo"]["hasNextPage"]:
+                break
+            after = search["pageInfo"]["endCursor"]
+        if skipped and not seen_any:
+            raise RuntimeError(f"All {skipped} node(s) skipped for query: {query} -- token may lack repo access")
+
+    def _collect_pr_ids(self, query: str, api_url_base: str) -> set:
+        ids: set = set()
+        after = None
+        while True:
+            resp = self._make_graphql_request(self.GRAPHQL_PR_IDS, {"q": query, "after": after}, api_url_base)
+            search = resp.json()["data"]["search"]
+            for node in search["nodes"]:
+                if node and node.get("number") is not None and node.get("repository"):
+                    ids.add(f"{node['repository']['nameWithOwner']}#{node['number']}")
+            if not search["pageInfo"]["hasNextPage"]:
+                break
+            after = search["pageInfo"]["endCursor"]
+        return ids
+
+    def _iter_day_queries(self, query: str):
+        m = CLOSED_CAPTURE_RE.search(query)
+        if not m:
+            yield query
+            return
+        start = datetime.strptime(m.group(1), "%Y-%m-%d")
+        end = datetime.strptime(m.group(2), "%Y-%m-%d")
+        cur = start
+        while cur <= end:
+            day = cur.strftime("%Y-%m-%d")
+            yield CLOSED_RANGE_RE.sub(f"closed:{day}..{day}", query)
+            cur += timedelta(days=1)
+
+    def _node_to_row(self, node: dict, instance: str, org: str, month: str, now: str) -> dict:
+        repo_full = node["repository"]["nameWithOwner"]
+        repo_name = node["repository"].get("name") or repo_full.split("/")[-1]
+        merged_at = node.get("mergedAt")
+        labels = [l["name"] for l in ((node.get("labels") or {}).get("nodes") or []) if l]
+        author = node.get("author") or {}
+        merged_by = node.get("mergedBy") or {}
+        return {
+            "instance": instance,
+            "org": org,
+            "repo": repo_name,
+            "pr_number": node["number"],
+            "title": node.get("title"),
+            "url": node.get("url"),
+            "author_login": author.get("login"),
+            "created_at": node.get("createdAt"),
+            "merged_at": merged_at,
+            "closed_at": node.get("closedAt"),
+            "updated_at": node.get("updatedAt"),
+            "hours_to_close": _hours_between(node.get("createdAt"), node.get("closedAt")),
+            "outcome": "merged" if merged_at else "closed_unmerged",
+            "state": node.get("state"),
+            "is_draft": node.get("isDraft"),
+            "merged_by_login": merged_by.get("login"),
+            "base_ref": node.get("baseRefName"),
+            "head_ref": node.get("headRefName"),
+            "additions": node.get("additions"),
+            "deletions": node.get("deletions"),
+            "changed_files": node.get("changedFiles"),
+            "review_decision": node.get("reviewDecision"),
+            "comment_count": (node.get("comments") or {}).get("totalCount"),
+            "review_count": (node.get("reviews") or {}).get("totalCount"),
+            "commit_count": (node.get("commits") or {}).get("totalCount"),
+            "label_names": labels,
+            "is_ai_authored": False,
+            "is_ai_reviewed": False,
+            "month": month,
+            "synced_at": now,
+        }
+
+    def _process_window(self, window_query, api_url_base, instance, org, month, now, markers, reviewer):
+        ai_authored_ids: set = set()
+        for marker in markers:
+            ai_authored_ids |= self._collect_pr_ids(f"{window_query} {marker}", api_url_base)
+        ai_reviewed_ids = self._collect_pr_ids(f"{window_query} {reviewer}", api_url_base) if reviewer else set()
+        for node in self._iter_pr_nodes(window_query, api_url_base):
+            row = self._node_to_row(node, instance, org, month, now)
+            key = f"{node['repository']['nameWithOwner']}#{node['number']}"
+            row["is_ai_authored"] = key in ai_authored_ids
+            row["is_ai_reviewed"] = key in ai_reviewed_ids
+            yield row
+
+    def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
+        now = datetime.utcnow().isoformat() + "Z"
+        partitions_to_process = [context] if context else self.partitions
+        markers = self.stream_config.get("markers", []) or []
+        reviewer = self.stream_config.get("reviewer_clause", "") or ""
+        for partition in partitions_to_process:
+            org = partition["org"]
+            month = partition["month"]
+            query = partition["search_query"]
+            api_url_base = partition["api_url_base"]
+            instance = self._scope().get("instance") or _instance_from_api_base(api_url_base)
+            # Adaptive granularity: only day-slice a month when it would exceed the
+            # 1000-result search cap. A month with <= cap results is fully retrievable
+            # in one windowed (paginated) pass, which avoids days x clauses query blow-up.
+            month_count = self._search_aggregate_count(query, api_url_base)
+            if month_count == 0:
+                continue
+            if month_count <= NODES_THRESHOLD:
+                yield from self._process_window(query, api_url_base, instance, org, month, now, markers, reviewer)
+            else:
+                self.logger.info("Month %s for %s has %d > %d results; day-slicing.", month, org, month_count, NODES_THRESHOLD)
+                for day_query in self._iter_day_queries(query):
+                    yield from self._process_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
+
+
 def validate_stream_config(stream_config: dict) -> list[str]:
     errors = []
     required_fields = ["name", "query_template"]
@@ -512,12 +756,18 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "name": sd.get("name"),
                 "query_template": sd.get("query_template"),
                 "description": sd.get("description"),
+                "mode": sd.get("mode"),
+                "markers": sd.get("markers", []),
+                "reviewer_clause": sd.get("reviewer_clause", ""),
             }
             errors = validate_stream_config(sc)
             if errors:
                 tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
-            streams.append(ConfigurableSearchCountStream(sc, tap))
+            if sd.get("mode") == "pr_velocity":
+                streams.append(ConfigurablePrVelocityStream(sc, tap))
+            else:
+                streams.append(ConfigurableSearchCountStream(sc, tap))
     else:
         tap.logger.warning("No search configuration found")
     if not streams:
