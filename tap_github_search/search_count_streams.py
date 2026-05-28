@@ -11,7 +11,10 @@ import requests
 import json
 from collections import Counter
 
+import time
+
 from singer_sdk import typing as th
+from singer_sdk.exceptions import RetriableAPIError
 from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
@@ -510,7 +513,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     GRAPHQL_PR_VELOCITY: ClassVar[str] = """
     query PrVelocity($q: String!, $after: String) {
-      search(query: $q, type: ISSUE, first: 100, after: $after) {
+      search(query: $q, type: ISSUE, first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
           ... on PullRequest {
@@ -592,12 +595,32 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         cfg_source = getattr(self, "_search_cfg", None) or self.config
         return cfg_source.get("search", {}).get("scope", {})
 
+    def _robust_graphql(self, query: str, variables: dict, api_url_base: str, tries: int = 8):
+        """Outer retry around _make_graphql_request: survives transient 502/gateway
+        timeouts on heavy queries (the inner request_decorator retries 5xx a few times;
+        this adds patient outer attempts with exponential backoff). Only transient
+        transport/5xx errors are retried; 4xx/auth/query errors fail fast."""
+        delay = 2.0
+        last_exc = None
+        for attempt in range(tries):
+            try:
+                return self._make_graphql_request(query, variables, api_url_base)
+            except (RetriableAPIError, requests.exceptions.RequestException) as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "GraphQL request failed (attempt %d/%d): %s; backing off %.1fs",
+                    attempt + 1, tries, str(exc)[:140], delay,
+                )
+                time.sleep(delay)
+                delay = min(delay * 1.8, 60.0)
+        raise last_exc
+
     def _iter_pr_nodes(self, query: str, api_url_base: str):
         after = None
         skipped = 0
         seen_any = False
         while True:
-            resp = self._make_graphql_request(self.GRAPHQL_PR_VELOCITY, {"q": query, "after": after}, api_url_base)
+            resp = self._robust_graphql(self.GRAPHQL_PR_VELOCITY, {"q": query, "after": after}, api_url_base)
             search = resp.json()["data"]["search"]
             for node in search["nodes"]:
                 if not node or node.get("number") is None or not node.get("repository"):
@@ -615,7 +638,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         ids: set = set()
         after = None
         while True:
-            resp = self._make_graphql_request(self.GRAPHQL_PR_IDS, {"q": query, "after": after}, api_url_base)
+            resp = self._robust_graphql(self.GRAPHQL_PR_IDS, {"q": query, "after": after}, api_url_base)
             search = resp.json()["data"]["search"]
             for node in search["nodes"]:
                 if node and node.get("number") is not None and node.get("repository"):
