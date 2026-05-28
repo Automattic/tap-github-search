@@ -14,8 +14,24 @@ from collections import Counter
 import time
 
 from singer_sdk import typing as th
-from singer_sdk.exceptions import RetriableAPIError
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.types import Context
+
+
+def _is_transient_graphql_failure(exc: Exception) -> bool:
+    """True for transient server-side failures worth retrying/skipping.
+    Covers 502/5xx (RetriableAPIError), transport errors (RequestException), AND
+    GitHub's HTTP-200 GraphQL 'INTERNAL' / 'Something went wrong' errors, which
+    tap-github maps to FatalAPIError but are in fact transient (heavy-query glitches).
+    Genuine 4xx/auth/validation FatalAPIErrors return False (fail fast)."""
+    if isinstance(exc, (RetriableAPIError, requests.exceptions.RequestException)):
+        return True
+    if isinstance(exc, FatalAPIError):
+        m = str(exc).lower()
+        return "graphql error" in m and (
+            "internal" in m or "something went wrong" in m or "timeout" in m or "timed out" in m
+        )
+    return False
 
 from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
@@ -513,7 +529,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     GRAPHQL_PR_VELOCITY: ClassVar[str] = """
     query PrVelocity($q: String!, $after: String) {
-      search(query: $q, type: ISSUE, first: 50, after: $after) {
+      search(query: $q, type: ISSUE, first: 25, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
           ... on PullRequest {
@@ -538,7 +554,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     GRAPHQL_PR_IDS: ClassVar[str] = """
     query PrIds($q: String!, $after: String) {
-      search(query: $q, type: ISSUE, first: 100, after: $after) {
+      search(query: $q, type: ISSUE, first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes { ... on PullRequest { number repository { nameWithOwner } } }
       }
@@ -605,7 +621,9 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         for attempt in range(tries):
             try:
                 return self._make_graphql_request(query, variables, api_url_base)
-            except (RetriableAPIError, requests.exceptions.RequestException) as exc:
+            except Exception as exc:
+                if not _is_transient_graphql_failure(exc):
+                    raise  # genuine 4xx/auth/validation/parse error -- fail fast
                 last_exc = exc
                 self.logger.warning(
                     "GraphQL request failed (attempt %d/%d): %s; backing off %.1fs",
@@ -713,8 +731,25 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             row["is_ai_reviewed"] = key in ai_reviewed_ids
             yield row
 
+    def _emit_window(self, window_query, api_url_base, instance, org, month, now, markers, reviewer):
+        """Materialize one window's rows atomically. If the window's queries keep failing
+        even after _robust_graphql exhausts its retries (a persistently-too-expensive page
+        that keeps 502-ing), log and SKIP that window instead of crashing the whole org's
+        sync. Skipped windows are counted and reported so gaps are known and re-fetchable."""
+        try:
+            return list(self._process_window(window_query, api_url_base, instance, org, month, now, markers, reviewer))
+        except Exception as exc:
+            if not _is_transient_graphql_failure(exc):
+                raise  # don't mask genuine bugs (parse errors, auth) -- only skip transient failures
+            self._skipped_windows += 1
+            self.logger.error(
+                "SKIPPING window after exhausted retries (%s): %s", window_query, str(exc)[:140]
+            )
+            return []
+
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
         now = datetime.utcnow().isoformat() + "Z"
+        self._skipped_windows = 0
         partitions_to_process = [context] if context else self.partitions
         markers = self.stream_config.get("markers", []) or []
         reviewer = self.stream_config.get("reviewer_clause", "") or ""
@@ -731,11 +766,16 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             if month_count == 0:
                 continue
             if month_count <= NODES_THRESHOLD:
-                yield from self._process_window(query, api_url_base, instance, org, month, now, markers, reviewer)
+                yield from self._emit_window(query, api_url_base, instance, org, month, now, markers, reviewer)
             else:
                 self.logger.info("Month %s for %s has %d > %d results; day-slicing.", month, org, month_count, NODES_THRESHOLD)
                 for day_query in self._iter_day_queries(query):
-                    yield from self._process_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
+                    yield from self._emit_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
+        if self._skipped_windows:
+            self.logger.warning(
+                "pr_velocity for %s: %d window(s) SKIPPED after exhausted retries -- data has known gaps.",
+                org, self._skipped_windows,
+            )
 
 
 def validate_stream_config(stream_config: dict) -> list[str]:
