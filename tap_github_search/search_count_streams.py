@@ -70,10 +70,14 @@ def _is_transient_graphql_failure(exc: Exception) -> bool:
             except Exception:
                 payload = None
             if isinstance(payload, dict):
-                for err in (payload.get("errors") or []):
-                    err_type = (err.get("type") or "").upper()
-                    if err_type in TRANSIENT_GRAPHQL_ERROR_TYPES:
-                        return True
+                errors_list = payload.get("errors")
+                if isinstance(errors_list, list):
+                    for err in errors_list:
+                        if not isinstance(err, dict):
+                            continue  # defensive: malformed error entries
+                        err_type = (err.get("type") or "").upper()
+                        if err_type in TRANSIENT_GRAPHQL_ERROR_TYPES:
+                            return True
         # Fallback substring match for environments where response parsing fails
         # (kept narrow to avoid false positives on real 4xx error messages).
         m = str(exc).lower()
@@ -692,6 +696,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             tries = int(os.environ.get("TAP_GITHUB_SEARCH_VELOCITY_OUTER_TRIES", "5"))
         if max_wall_seconds is None:
             max_wall_seconds = float(os.environ.get("TAP_GITHUB_SEARCH_VELOCITY_MAX_WALL_SECONDS", "180"))
+        if tries < 1:
+            raise ValueError(f"_robust_graphql: tries must be >= 1, got {tries}")
         start = time.monotonic()
         delay = 2.0
         last_exc = None
