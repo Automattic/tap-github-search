@@ -19,11 +19,13 @@ from tap_github_search.search_count_streams import (
     ConfigurablePrVelocityStream,
     ConfigurableSearchCountStream,
     NODES_THRESHOLD,
+    VALID_API_HOSTS,
     VALID_STREAM_MODES,
     _hours_between,
     _instance_from_api_base,
     _is_transient_graphql_failure,
     create_configurable_streams,
+    validate_scope,
     validate_stream_config,
 )
 
@@ -304,7 +306,7 @@ class TestNodeToRow:
         assert row["pr_number"] == 42
         assert row["author_login"] is None
         assert row["merged_by_login"] is None
-        assert row["label_names"] == ["bug"]   # nulls filtered, valid kept
+        assert row["label_names"] == '["bug"]'   # JSON-encoded; nulls filtered, valid kept
         assert row["outcome"] == "closed_unmerged"  # mergedAt None -> unmerged
         assert row["hours_to_close"] == 24.0
         assert row["is_ai_authored"] is False
@@ -387,3 +389,40 @@ class TestValidateStreamConfig:
             "name": "x", "query_template": "{org} {start} {end}", "mode": "pr-velocity",  # hyphen typo
         })
         assert any("Unknown mode" in e for e in errs)
+
+
+class TestValidateScope:
+    """SSRF allowlist on api_url_base. Defense-in-depth against scope misconfig."""
+
+    def test_accepts_known_hosts(self):
+        for host in VALID_API_HOSTS:
+            errs = validate_scope({"api_url_base": f"https://{host}/api/v3"})
+            assert errs == [], f"unexpected errors for known host {host}: {errs}"
+
+    def test_rejects_unknown_host(self):
+        errs = validate_scope({"api_url_base": "https://evil.example.com/api"})
+        assert any("not in allowlist" in e for e in errs)
+
+    def test_rejects_http_scheme(self):
+        errs = validate_scope({"api_url_base": "http://api.github.com"})
+        assert any("must use https" in e for e in errs)
+
+    def test_allows_missing_api_url_base(self):
+        # api_url_base is optional; partitions() falls back to https://api.github.com
+        assert validate_scope({}) == []
+
+    def test_create_configurable_streams_raises_on_bad_scope(self):
+        tap = _DummyTap()
+        config = {
+            "search": {
+                "streams": [{
+                    "name": "vel",
+                    "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
+                    "mode": "pr_velocity",
+                }],
+                "scope": {"api_url_base": "https://evil.example.com", "orgs": ["x"]},
+                "backfill": {"start_month": "2026-04"},
+            }
+        }
+        with pytest.raises(ValueError, match="not in allowlist"):
+            create_configurable_streams(tap, config_override=config)

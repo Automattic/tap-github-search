@@ -6,6 +6,7 @@ import calendar
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
+from urllib.parse import urlparse
 import os
 import requests
 import json
@@ -668,7 +669,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             th.Property("comment_count", th.IntegerType),
             th.Property("review_count", th.IntegerType),
             th.Property("commit_count", th.IntegerType),
-            th.Property("label_names", th.ArrayType(th.StringType)),
+            th.Property("label_names", th.StringType),
             th.Property("is_ai_authored", th.BooleanType),
             th.Property("is_ai_reviewed", th.BooleanType),
             th.Property("month", th.StringType),
@@ -812,7 +813,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             "comment_count": (node.get("comments") or {}).get("totalCount"),
             "review_count": (node.get("reviews") or {}).get("totalCount"),
             "commit_count": (node.get("commits") or {}).get("totalCount"),
-            "label_names": labels,
+            "label_names": json.dumps(labels),
             "is_ai_authored": False,
             "is_ai_reviewed": False,
             "month": month,
@@ -902,6 +903,35 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
 VALID_STREAM_MODES = frozenset({None, "pr_velocity"})
 
+# Hosts the tap is permitted to talk to. Defense-in-depth against a misconfigured
+# scope pointing the GraphQL/REST clients at an unintended endpoint (SSRF). The
+# operator config provides api_url_base; this list is the trusted set.
+VALID_API_HOSTS = frozenset({
+    "api.github.com",       # github.com public
+    "github.a8c.com",       # Automattic GHES
+    "github.tumblr.net",    # Tumblr GHES
+})
+
+
+def validate_scope(scope: dict) -> list[str]:
+    """Validate top-level scope settings (one check per scope, not per stream)."""
+    errors = []
+    api_url_base = scope.get("api_url_base")
+    if api_url_base:
+        parsed = urlparse(api_url_base)
+        if parsed.scheme != "https":
+            errors.append(
+                f"api_url_base {api_url_base!r} must use https (got scheme={parsed.scheme!r})"
+            )
+        elif not parsed.hostname:
+            errors.append(f"api_url_base {api_url_base!r} has no hostname")
+        elif parsed.hostname not in VALID_API_HOSTS:
+            errors.append(
+                f"api_url_base host {parsed.hostname!r} not in allowlist "
+                f"{sorted(VALID_API_HOSTS)}; add the host to VALID_API_HOSTS if new"
+            )
+    return errors
+
 
 def validate_stream_config(stream_config: dict) -> list[str]:
     errors = []
@@ -945,6 +975,11 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
     
     if "search" in config:
         s = config.get("search", {})
+        scope_errors = validate_scope(s.get("scope", {}))
+        if scope_errors:
+            for err in scope_errors:
+                tap.logger.error(f"Invalid scope: {err}")
+            raise ValueError(f"Invalid scope: {'; '.join(scope_errors)}")
         for sd in s.get("streams", []):
             sc = {
                 "name": sd.get("name"),
