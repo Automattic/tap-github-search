@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -75,7 +76,21 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
                 )
         except Exception:
             pass
-        return api_base_url.rstrip("/")
+        api_base_url = api_base_url.rstrip("/")
+
+        # Defense-in-depth: re-validate against the SSRF allowlist before the
+        # authenticator ever emits the PAT to this host. validate_scope() in
+        # create_configurable_streams gates the normal flow; this gate covers
+        # paths that construct a stream without going through that factory.
+        # Lazy import to avoid the circular (search_count_streams imports us).
+        from tap_github_search.search_count_streams import VALID_API_HOSTS
+        host = urlparse(api_base_url).hostname
+        if host not in VALID_API_HOSTS:
+            raise ValueError(
+                f"Refusing to authenticate to {host!r}: not in "
+                f"VALID_API_HOSTS {sorted(VALID_API_HOSTS)}"
+            )
+        return api_base_url
 
     def prepare_tokens(self) -> list[TokenManager]:  # type: ignore[override]
         env_dict = self.get_env()

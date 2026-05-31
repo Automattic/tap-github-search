@@ -426,3 +426,25 @@ class TestValidateScope:
         }
         with pytest.raises(ValueError, match="not in allowlist"):
             create_configurable_streams(tap, config_override=config)
+
+    def test_authenticator_rejects_non_allowlisted_host(self):
+        """Two-layer SSRF defense: the authenticator must refuse to emit a PAT
+        to a host outside VALID_API_HOSTS even if a stream is constructed
+        outside the create_configurable_streams factory."""
+        from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
+        stream = SimpleNamespace(
+            _search_cfg={"search": {"scope": {"api_url_base": "https://evil.example.com"}}},
+            config={},
+        )
+        with pytest.raises(ValueError, match="Refusing to authenticate"):
+            WrapperGitHubTokenAuthenticator._extract_api_base_url_from_stream(stream)
+
+    def test_authenticator_accepts_allowlisted_host(self):
+        from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
+        for host in VALID_API_HOSTS:
+            stream = SimpleNamespace(
+                _search_cfg={"search": {"scope": {"api_url_base": f"https://{host}/api/v3"}}},
+                config={},
+            )
+            url = WrapperGitHubTokenAuthenticator._extract_api_base_url_from_stream(stream)
+            assert host in url

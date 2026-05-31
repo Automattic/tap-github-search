@@ -91,6 +91,42 @@ tap-github --help
 tap-github --config CONFIG --discover > ./catalog.json
 ```
 
+## tap-github-search Wrapper Config
+
+This wrapper adds a top-level `search` config block on top of upstream `tap-github`:
+
+```yaml
+search:
+  scope:
+    api_url_base: https://api.github.com      # or https://github.a8c.com/api/v3 (GHES)
+    instance: github_com                       # github_com | a8c_ghe | tumblr_ghe
+    orgs: [Automattic]
+    breakdown: repo                            # optional; count streams only
+  backfill:
+    start_month: "2026-02"
+  streams:
+    - name: pr_velocity
+      mode: pr_velocity                        # one row per closed PR; omit for the count stream
+      query_template: "org:{org} type:pr is:closed closed:{start}..{end}"
+      markers: ['"Generated with Claude Code"']  # body markers → is_ai_authored
+      reviewer_clause: "commenter:claude[bot]"   # search suffix → is_ai_reviewed
+```
+
+For SSRF defense-in-depth, `api_url_base` is checked against an allowlist
+(`api.github.com`, `github.a8c.com`, `github.tumblr.net`) at both config-load
+and authenticator-emit time. Add a host to `VALID_API_HOSTS` in
+`tap_github_search/search_count_streams.py` if you legitimately need another.
+
+### Tap-specific environment knobs
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TAP_GITHUB_SEARCH_AUTH_TOKEN` | (required) | GitHub Personal Access Token |
+| `TAP_GITHUB_SEARCH_CONFIG_B64` | — | Base64-encoded `search` config, overrides `meltano.yml` |
+| `TAP_GITHUB_SEARCH_BATCH_SIZE` | 100 | GraphQL page size for count streams |
+| `TAP_GITHUB_SEARCH_VELOCITY_OUTER_TRIES` | 5 | Outer retry attempts on transient 5xx/INTERNAL in `pr_velocity` |
+| `TAP_GITHUB_SEARCH_VELOCITY_MAX_WALL_SECONDS` | 180 | Wall-time budget per `_robust_graphql` call (pr_velocity) |
+
 ## Contributing
 This project uses parent-child streams. Learn more about them [here.](https://gitlab.com/meltano/sdk/-/blob/main/docs/parent_streams.md)
 
