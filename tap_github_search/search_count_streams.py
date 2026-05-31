@@ -18,19 +18,74 @@ from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.types import Context
 
 
+# GraphQL error `type` values that indicate a transient server-side failure (worth
+# retrying or skipping the window). Source: GitHub GraphQL API error responses on
+# overloaded queries / brief gateway issues. Permanent errors (FORBIDDEN, NOT_FOUND,
+# UNAUTHORIZED, etc.) are NOT in this set and will fail fast.
+TRANSIENT_GRAPHQL_ERROR_TYPES = frozenset({
+    "INTERNAL",
+    "RATE_LIMITED",
+    "SERVICE_UNAVAILABLE",
+    "MAX_NODE_LIMIT_EXCEEDED",
+    "TIMEOUT",
+    "BAD_GATEWAY",
+})
+
+
 def _is_transient_graphql_failure(exc: Exception) -> bool:
     """True for transient server-side failures worth retrying/skipping.
-    Covers 502/5xx (RetriableAPIError), transport errors (RequestException), AND
-    GitHub's HTTP-200 GraphQL 'INTERNAL' / 'Something went wrong' errors, which
-    tap-github maps to FatalAPIError but are in fact transient (heavy-query glitches).
-    Genuine 4xx/auth/validation FatalAPIErrors return False (fail fast)."""
+
+    Covers:
+      - 502/5xx and transport errors (RetriableAPIError, requests.RequestException).
+      - GitHub's HTTP-200 GraphQL responses with a transient `errors[*].type`
+        (INTERNAL, RATE_LIMITED, SERVICE_UNAVAILABLE, etc.) which tap-github maps to
+        FatalAPIError but are in fact transient.
+      - HTTP 403 secondary-rate-limit responses, identified by body text containing
+        "secondary rate limit" or "abuse" (current code mistakenly treats these as
+        permanent FORBIDDEN).
+
+    Permanent failures (genuine 4xx auth/validation, FORBIDDEN org-policy blocks,
+    NOT_FOUND, etc.) return False and fail fast.
+    """
     if isinstance(exc, (RetriableAPIError, requests.exceptions.RequestException)):
         return True
     if isinstance(exc, FatalAPIError):
+        # Structural parsing of the response body (preferred over substring matching).
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            # 403 with secondary-rate-limit signature: transient (the regular
+            # FORBIDDEN classic-PAT block is permanent and does NOT match this).
+            status = getattr(resp, "status_code", None)
+            if status == 403:
+                try:
+                    body = (resp.text or "").lower()
+                except Exception:
+                    body = ""
+                if "secondary rate limit" in body or "abuse detection" in body:
+                    return True
+            # 200 with structured GraphQL `errors[*].type`: transient if any error's
+            # type is in our transient set.
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                for err in (payload.get("errors") or []):
+                    err_type = (err.get("type") or "").upper()
+                    if err_type in TRANSIENT_GRAPHQL_ERROR_TYPES:
+                        return True
+        # Fallback substring match for environments where response parsing fails
+        # (kept narrow to avoid false positives on real 4xx error messages).
         m = str(exc).lower()
-        return "graphql error" in m and (
-            "internal" in m or "something went wrong" in m or "timeout" in m or "timed out" in m
-        )
+        if "graphql error" in m and any(
+            tok in m for tok in (
+                "'type': 'internal'",
+                "'type': 'rate_limited'",
+                "'type': 'service_unavailable'",
+                "something went wrong while executing",
+            )
+        ):
+            return True
     return False
 
 from tap_github.client import GitHubGraphqlStream
@@ -562,6 +617,12 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
     }
     """
 
+    # Day-window pre-flight threshold: if a day's issueCount is at or above this,
+    # we know GraphQL search will silently truncate at 1000. Skip + log loudly with
+    # 100-PR safety margin. Empirical day-max on busy orgs is ~400; this only
+    # protects against future spike days.
+    DAY_PREFLIGHT_CAP: ClassVar[int] = 900
+
     def __init__(self, stream_config: dict, tap):
         self.stream_config = stream_config
         self.query_template = stream_config["query_template"]
@@ -569,6 +630,9 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self.name = stream_config["name"]
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
         self.tap = tap
+        # Cumulative across all partitions for this stream's lifetime; get_records tracks
+        # per-partition deltas for attributed logging.
+        self._skipped_windows = 0
         # Skip ConfigurableSearchCountStream.__init__ (it forces the *_search_counts name + count schema).
         SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
 
@@ -611,11 +675,24 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         cfg_source = getattr(self, "_search_cfg", None) or self.config
         return cfg_source.get("search", {}).get("scope", {})
 
-    def _robust_graphql(self, query: str, variables: dict, api_url_base: str, tries: int = 8):
+    def _robust_graphql(self, query: str, variables: dict, api_url_base: str, tries: int | None = None, max_wall_seconds: float | None = None):
         """Outer retry around _make_graphql_request: survives transient 502/gateway
         timeouts on heavy queries (the inner request_decorator retries 5xx a few times;
-        this adds patient outer attempts with exponential backoff). Only transient
-        transport/5xx errors are retried; 4xx/auth/query errors fail fast."""
+        this adds patient outer attempts with exponential backoff).
+
+        Only transient transport/5xx/GraphQL-INTERNAL errors are retried; 4xx/auth
+        errors fail fast.
+
+        Bounded by both attempt count AND wall-time so a sustained outage can't block
+        a partition for hours. Both are env-configurable for ops tuning:
+          TAP_GITHUB_SEARCH_VELOCITY_OUTER_TRIES (default 5)
+          TAP_GITHUB_SEARCH_VELOCITY_MAX_WALL_SECONDS (default 180)
+        """
+        if tries is None:
+            tries = int(os.environ.get("TAP_GITHUB_SEARCH_VELOCITY_OUTER_TRIES", "5"))
+        if max_wall_seconds is None:
+            max_wall_seconds = float(os.environ.get("TAP_GITHUB_SEARCH_VELOCITY_MAX_WALL_SECONDS", "180"))
+        start = time.monotonic()
         delay = 2.0
         last_exc = None
         for attempt in range(tries):
@@ -625,9 +702,16 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 if not _is_transient_graphql_failure(exc):
                     raise  # genuine 4xx/auth/validation/parse error -- fail fast
                 last_exc = exc
+                elapsed = time.monotonic() - start
+                if elapsed >= max_wall_seconds:
+                    self.logger.warning(
+                        "GraphQL request exceeded wall-time budget %.0fs after %d attempt(s); giving up.",
+                        max_wall_seconds, attempt + 1,
+                    )
+                    raise
                 self.logger.warning(
-                    "GraphQL request failed (attempt %d/%d): %s; backing off %.1fs",
-                    attempt + 1, tries, str(exc)[:140], delay,
+                    "GraphQL request failed (attempt %d/%d, %.1fs elapsed): %s; backing off %.1fs",
+                    attempt + 1, tries, elapsed, str(exc)[:140], delay,
                 )
                 time.sleep(delay)
                 delay = min(delay * 1.8, 60.0)
@@ -650,7 +734,17 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 break
             after = search["pageInfo"]["endCursor"]
         if skipped and not seen_any:
-            raise RuntimeError(f"All {skipped} node(s) skipped for query: {query} -- token may lack repo access")
+            # All nodes were null/inaccessible across all pages. This usually means
+            # the token lacks access to every repo in this window, OR every result
+            # was a ghost-user PR. Don't raise -- crashing the whole org's sync over
+            # one bad window is worse than emitting zero rows for that window. Log
+            # loudly so ops can investigate.
+            self.logger.error(
+                "All %d node(s) returned null/inaccessible for query: %s -- "
+                "likely a token-access issue; emitting 0 rows for this window.",
+                skipped, query,
+            )
+            return
 
     def _collect_pr_ids(self, query: str, api_url_base: str) -> set:
         ids: set = set()
@@ -749,11 +843,11 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
         now = datetime.utcnow().isoformat() + "Z"
-        self._skipped_windows = 0
         partitions_to_process = [context] if context else self.partitions
         markers = self.stream_config.get("markers", []) or []
         reviewer = self.stream_config.get("reviewer_clause", "") or ""
         for partition in partitions_to_process:
+            partition_skipped_start = self._skipped_windows  # delta-track per partition
             org = partition["org"]
             month = partition["month"]
             query = partition["search_query"]
@@ -770,12 +864,37 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             else:
                 self.logger.info("Month %s for %s has %d > %d results; day-slicing.", month, org, month_count, NODES_THRESHOLD)
                 for day_query in self._iter_day_queries(query):
+                    # Peak-day pre-flight: if a single day would hit/exceed the 1000-
+                    # result search cap, pagination silently truncates. Detect via a
+                    # cheap issueCount probe and skip+log loudly rather than emit a
+                    # partial day. Repo-split fallback is a documented next step.
+                    try:
+                        day_count = self._search_aggregate_count(day_query, api_url_base)
+                    except Exception as exc:
+                        # Don't crash the org over a probe failure; treat as 0 and let
+                        # _emit_window's retry/skip handle the subsequent fetch.
+                        self.logger.warning("Day-count probe failed for %s: %s", day_query, str(exc)[:140])
+                        day_count = 0
+                    if day_count >= self.DAY_PREFLIGHT_CAP:
+                        self._skipped_windows += 1
+                        self.logger.error(
+                            "SKIPPING day-window: count=%d >= cap=%d (search would silently truncate). "
+                            "Sub-slice by repo or refine the query. Window: %s",
+                            day_count, self.DAY_PREFLIGHT_CAP, day_query,
+                        )
+                        continue
                     yield from self._emit_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
-        if self._skipped_windows:
-            self.logger.warning(
-                "pr_velocity for %s: %d window(s) SKIPPED after exhausted retries -- data has known gaps.",
-                org, self._skipped_windows,
-            )
+            # Per-partition skip attribution -- attributes correctly to (instance, org, month)
+            # rather than reporting the last-iterated org with the aggregate count.
+            partition_skipped = self._skipped_windows - partition_skipped_start
+            if partition_skipped:
+                self.logger.warning(
+                    "pr_velocity: %d window(s) SKIPPED for instance=%s org=%s month=%s -- data has known gaps.",
+                    partition_skipped, instance, org, month,
+                )
+
+
+VALID_STREAM_MODES = frozenset({None, "pr_velocity"})
 
 
 def validate_stream_config(stream_config: dict) -> list[str]:
@@ -791,6 +910,12 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     for placeholder in ["{org}", "{start}", "{end}"]:
         if placeholder not in query_template:
             errors.append(f"Query template must contain {placeholder} placeholder")
+    mode = stream_config.get("mode")
+    if mode not in VALID_STREAM_MODES:
+        errors.append(
+            f"Unknown mode {mode!r}: expected one of {sorted(repr(m) for m in VALID_STREAM_MODES)} "
+            f"(omit `mode` for the default count stream)"
+        )
     return errors
 
 
