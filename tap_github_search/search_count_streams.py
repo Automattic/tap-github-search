@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+import base64
 import calendar
-import re
-from datetime import date, datetime, timedelta
-from typing import Any, ClassVar, Iterable, Mapping
-from urllib.parse import urlparse
-import os
-import requests
 import json
-from collections import Counter
-
+import os
+import re
 import time
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, ClassVar, Iterable
+
+import requests
 
 from singer_sdk import typing as th
 from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.types import Context
+
+from tap_github.client import GitHubGraphqlStream
+from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
+from tap_github_search.github_hosts import (
+    VALID_API_HOSTS as VALID_API_HOSTS,
+    instance_from_api_base,
+    normalize_api_base_url,
+)
+from tap_github_search.utils.date_utils import (
+    get_last_complete_month,
+    get_last_complete_month_date,
+    month_range,
+    month_to_date,
+)
 
 
 # GraphQL error `type` values that indicate a transient server-side failure (worth
@@ -31,6 +45,70 @@ TRANSIENT_GRAPHQL_ERROR_TYPES = frozenset({
     "TIMEOUT",
     "BAD_GATEWAY",
 })
+
+RATE_LIMIT_GRAPHQL_ERROR_TYPES = frozenset({"RATE_LIMITED"})
+
+
+def _response_for_exception(exc: Exception):
+    return getattr(exc, "response", None)
+
+
+def _graphql_error_types_from_response(response) -> set[str]:
+    try:
+        payload = response.json()
+    except Exception:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    errors_list = payload.get("errors")
+    if not isinstance(errors_list, list):
+        return set()
+    return {
+        str(err.get("type", "")).upper()
+        for err in errors_list
+        if isinstance(err, dict) and err.get("type")
+    }
+
+
+def _is_rate_limit_failure(exc: Exception) -> bool:
+    resp = _response_for_exception(exc)
+    if resp is not None:
+        if _graphql_error_types_from_response(resp) & RATE_LIMIT_GRAPHQL_ERROR_TYPES:
+            return True
+        status = getattr(resp, "status_code", None)
+        if status in (403, 429):
+            try:
+                body = (resp.text or "").lower()
+            except Exception:
+                body = ""
+            return "rate limit" in body or "abuse detection" in body
+
+    message = str(exc).lower()
+    return "rate_limited" in message or "rate limit" in message
+
+
+def _retry_delay_seconds(exc: Exception, fallback: float) -> float:
+    resp = _response_for_exception(exc)
+    headers = getattr(resp, "headers", {}) if resp is not None else {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.0)
+        except ValueError:
+            pass
+
+    reset_at = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset")
+    if reset_at:
+        try:
+            return max(float(reset_at) - time.time(), 0.0)
+        except ValueError:
+            pass
+
+    return fallback
+
+
+def _utc_now_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _is_transient_graphql_failure(exc: Exception) -> bool:
@@ -52,7 +130,7 @@ def _is_transient_graphql_failure(exc: Exception) -> bool:
         return True
     if isinstance(exc, FatalAPIError):
         # Structural parsing of the response body (preferred over substring matching).
-        resp = getattr(exc, "response", None)
+        resp = _response_for_exception(exc)
         if resp is not None:
             # 403 with secondary-rate-limit signature: transient (the regular
             # FORBIDDEN classic-PAT block is permanent and does NOT match this).
@@ -66,19 +144,8 @@ def _is_transient_graphql_failure(exc: Exception) -> bool:
                     return True
             # 200 with structured GraphQL `errors[*].type`: transient if any error's
             # type is in our transient set.
-            try:
-                payload = resp.json()
-            except Exception:
-                payload = None
-            if isinstance(payload, dict):
-                errors_list = payload.get("errors")
-                if isinstance(errors_list, list):
-                    for err in errors_list:
-                        if not isinstance(err, dict):
-                            continue  # defensive: malformed error entries
-                        err_type = (err.get("type") or "").upper()
-                        if err_type in TRANSIENT_GRAPHQL_ERROR_TYPES:
-                            return True
+            if _graphql_error_types_from_response(resp) & TRANSIENT_GRAPHQL_ERROR_TYPES:
+                return True
         # Fallback substring match for environments where response parsing fails
         # (kept narrow to avoid false positives on real 4xx error messages).
         m = str(exc).lower()
@@ -93,24 +160,14 @@ def _is_transient_graphql_failure(exc: Exception) -> bool:
             return True
     return False
 
-from tap_github.client import GitHubGraphqlStream
-from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
-
 # Essential batching configuration
 BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_BATCH_SIZE", "100"))
 NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
 
 # Regex patterns for query parsing
 ORG_PATTERN = re.compile(r"\borg:([^\s]+)")
-REPO_PATTERN = re.compile(r"\brepo:([^\s/]+)/([^\s]+)")  
+REPO_PATTERN = re.compile(r"\brepo:([^\s/]+)/([^\s]+)")
 ORG_REPLACEMENT_PATTERN = re.compile(r"\borg:[^\s]+\s*")
-
-from tap_github_search.utils.date_utils import (
-    get_last_complete_month,
-    get_last_complete_month_date,
-    month_to_date,
-    month_range,
-)
 
 
 class SearchCountStreamBase(GitHubGraphqlStream):
@@ -146,7 +203,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
         """Make a GraphQL request with standardized payload building."""
         payload = self._build_graphql_payload(query_template, variables)
-        graphql_base = api_url_base.rstrip("/").removesuffix("/v3")
+        graphql_base = normalize_api_base_url(api_url_base).removesuffix("/v3")
         prepared_request = self.build_prepared_request(method="POST", url=f"{graphql_base}/graphql", json=payload)
         decorated_request = self.request_decorator(self._request)
         return decorated_request(prepared_request, None)
@@ -240,8 +297,79 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             return True
         return month_date > bookmark_date
 
+    def _build_search_query(self, org: str, start_date: str, end_date: str, stream_type: str) -> str:
+        return self.query_template.format(org=org, start=start_date, end=end_date)
+
+    def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, stream_type: str) -> str:
+        return self.query_template.format(org=repo, start=start_date, end=end_date)
+
+    @property
+    def partitions(self) -> list[Context]:
+        cfg_source = getattr(self, "_search_cfg", None) or self.config
+        s = cfg_source.get("search", {})
+        scope = s.get("scope", {})
+        orgs = scope.get("orgs", [])
+        repos = scope.get("repos", [])
+        api_url_base = normalize_api_base_url(scope.get("api_url_base"))
+        breakdown = scope.get("breakdown", "none") == "repo"
+        if not orgs and not repos:
+            self.logger.warning(f"No orgs or repos provided for {self.name}")
+            return []
+
+        partitions: list[Context] = []
+        months = self._get_months_to_process()
+        stream_name = self.stream_config["name"]
+
+        org_bookmarks: dict[tuple[str, str], date | None] = {}
+        for org in orgs:
+            bookmark_str = self._get_bookmark_for_context({"org": org})
+            org_bookmarks[("single", org)] = month_to_date(bookmark_str) if bookmark_str else None
+
+        repo_bookmarks: dict[tuple[str, str], date | None] = {}
+        for repo in repos:
+            bookmark_str = self._get_bookmark_for_context({"org": repo, "repo": repo})
+            repo_bookmarks[("single", repo)] = month_to_date(bookmark_str) if bookmark_str else None
+
+        for month in months:
+            year, month_num = map(int, month.split("-"))
+            start_date = f"{year:04d}-{month_num:02d}-01"
+            last_day = calendar.monthrange(year, month_num)[1]
+            end_date = f"{year:04d}-{month_num:02d}-{last_day:02d}"
+
+            for org in orgs:
+                bookmark_date = org_bookmarks.get(("single", org))
+                if self._should_include_month(month, bookmark_date):
+                    query = self._build_search_query(org, start_date, end_date, self.stream_type)
+                    partitions.append({
+                        "search_name": stream_name,
+                        "search_query": query,
+                        "api_url_base": api_url_base,
+                        "org": org,
+                        "month": month,
+                        "kind": stream_name,
+                        "repo_breakdown": breakdown,
+                    })
+
+            for repo in repos:
+                org = repo.split("/")[0]
+                bookmark_date = repo_bookmarks.get(("single", repo))
+                if self._should_include_month(month, bookmark_date):
+                    query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
+                    partitions.append({
+                        "search_name": stream_name,
+                        "search_query": query,
+                        "api_url_base": api_url_base,
+                        "org": org,
+                        "month": month,
+                        "kind": stream_name,
+                        "repo_breakdown": False,
+                    })
+
+        self.logger.info(f"Generated {len(partitions)} partitions after incremental filtering")
+        return partitions
+
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_z()
         partitions_to_process = [context] if context else self.partitions
         
         for partition in partitions_to_process:
@@ -478,87 +606,9 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         self.tap = tap
         super().__init__(tap=tap, name=self.name, schema=self.get_schema())
 
-    def _build_search_query(self, org: str, start_date: str, end_date: str, stream_type: str) -> str:
-        return self.query_template.format(org=org, start=start_date, end=end_date)
-
-    def _build_repo_search_query(self, repo: str, start_date: str, end_date: str, stream_type: str) -> str:
-        return self.query_template.format(org=repo, start=start_date, end=end_date)
-
-    @property
-    def partitions(self) -> list[Context]:
-        cfg_source = getattr(self, "_search_cfg", None) or self.config
-        s = cfg_source.get("search", {})
-        scope = s.get("scope", {})
-        orgs = scope.get("orgs", [])
-        repos = scope.get("repos", [])
-        api_url_base = scope.get("api_url_base", "https://api.github.com")
-        breakdown = scope.get("breakdown", "none") == "repo"
-        if not orgs and not repos:
-            self.logger.warning(f"No orgs or repos provided for {self.name}")
-            return []
-
-        partitions: list[Context] = []
-        months = self._get_months_to_process()
-        stream_name = self.stream_config["name"]
-
-        org_bookmarks: dict[tuple[str, str], date | None] = {}
-        for org in orgs:
-            bookmark_str = self._get_bookmark_for_context({"org": org})
-            org_bookmarks[("single", org)] = month_to_date(bookmark_str) if bookmark_str else None
-
-        repo_bookmarks: dict[tuple[str, str], date | None] = {}
-        for repo in repos:
-            bookmark_str = self._get_bookmark_for_context({"org": repo, "repo": repo})
-            repo_bookmarks[("single", repo)] = month_to_date(bookmark_str) if bookmark_str else None
-
-        for month in months:
-            year, month_num = map(int, month.split("-"))
-            start_date = f"{year:04d}-{month_num:02d}-01"
-            last_day = calendar.monthrange(year, month_num)[1]
-            end_date = f"{year:04d}-{month_num:02d}-{last_day:02d}"
-
-            for org in orgs:
-                bookmark_date = org_bookmarks.get(("single", org))
-                if self._should_include_month(month, bookmark_date):
-                    query = self._build_search_query(org, start_date, end_date, self.stream_type)
-                    partitions.append({
-                        "search_name": stream_name,
-                        "search_query": query,
-                        "api_url_base": api_url_base,
-                        "org": org,
-                        "month": month,
-                        "kind": stream_name,
-                        "repo_breakdown": breakdown,
-                    })
-
-            for repo in repos:
-                org = repo.split("/")[0]
-                bookmark_date = repo_bookmarks.get(("single", repo))
-                if self._should_include_month(month, bookmark_date):
-                    query = self._build_repo_search_query(repo, start_date, end_date, self.stream_type)
-                    partitions.append({
-                        "search_name": stream_name,
-                        "search_query": query,
-                        "api_url_base": api_url_base,
-                        "org": org,
-                        "month": month,
-                        "kind": stream_name,
-                        "repo_breakdown": False,
-                    })
-
-        self.logger.info(f"Generated {len(partitions)} partitions after incremental filtering")
-        return partitions
-
 
 def _instance_from_api_base(api_url_base: str) -> str:
-    base = (api_url_base or "").lower()
-    if "github.a8c.com" in base:
-        return "a8c_ghe"
-    if "github.tumblr.net" in base:
-        return "tumblr_ghe"
-    if "api.github.com" in base or "github.com" in base:
-        return "github_com"
-    return "unknown"
+    return instance_from_api_base(api_url_base)
 
 
 CLOSED_RANGE_RE = re.compile(r"closed:\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}")
@@ -573,19 +623,33 @@ def _hours_between(created: str | None, closed: str | None) -> float | None:
     return round((c1 - c0).total_seconds() / 3600.0, 4)
 
 
-class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
+def _marker_to_literal(marker: str) -> str:
+    marker = marker.strip()
+    if len(marker) >= 2 and marker[0] == marker[-1] and marker[0] in {"'", '"'}:
+        return marker[1:-1]
+    return marker
+
+
+def _body_contains_marker(body_text: str | None, marker: str) -> bool:
+    literal = _marker_to_literal(marker)
+    if not literal:
+        return False
+    return literal.casefold() in (body_text or "").casefold()
+
+
+class ConfigurablePrVelocityStream(SearchCountStreamBase):
     """Per-PR velocity stream: one row per closed PR with timing + AI cohort flags.
 
-    Reuses the count stream's transport, auth, monthly partitioning and _search_cfg
-    injection; overrides the schema and get_records to emit per-PR rows. The base
-    is:closed query is day-sliced to stay under the 1000-result search cap, and AI
-    membership is folded into is_ai_authored / is_ai_reviewed booleans before emit.
+    Reuses the wrapper transport, auth, monthly partitioning and _search_cfg
+    injection, but emits per-PR rows. The base is:closed query is day-sliced to
+    stay under the 1000-result search cap, and AI membership is folded into
+    is_ai_authored / is_ai_reviewed booleans before emit.
     """
 
-    replication_method: ClassVar[str] = "FULL_TABLE"
-    replication_key = None
+    replication_method: ClassVar[str] = "INCREMENTAL"
+    replication_key = "month"
     primary_keys: ClassVar[list[str]] = ["instance", "org", "repo", "pr_number"]
-    state_partitioning_keys: ClassVar[list[str]] = []
+    state_partitioning_keys: ClassVar[list[str]] = ["org"]
 
     GRAPHQL_PR_VELOCITY: ClassVar[str] = """
     query PrVelocity($q: String!, $after: String) {
@@ -593,7 +657,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         pageInfo { hasNextPage endCursor }
         nodes {
           ... on PullRequest {
-            number title url state isDraft
+            number title bodyText url state isDraft
             createdAt closedAt mergedAt updatedAt
             author { login }
             mergedBy { login }
@@ -601,10 +665,10 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             baseRefName headRefName
             additions deletions changedFiles
             reviewDecision
-            comments { totalCount }
-            reviews { totalCount }
-            commits { totalCount }
-            labels(first: 10) { nodes { name } }
+            comments(first: 1) { totalCount }
+            reviews(first: 1) { totalCount }
+            commits(first: 1) { totalCount }
+            labels(first: 100) { nodes { name } }
           }
         }
       }
@@ -622,11 +686,9 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
     }
     """
 
-    # Day-window pre-flight threshold: if a day's issueCount is at or above this,
-    # we know GraphQL search will silently truncate at 1000. Skip + log loudly with
-    # 100-PR safety margin. Empirical day-max on busy orgs is ~400; this only
-    # protects against future spike days.
-    DAY_PREFLIGHT_CAP: ClassVar[int] = 900
+    # Day-window pre-flight threshold: GraphQL search only returns the first 1000
+    # results. Skip + log loudly only when a day is above that retrievable cap.
+    DAY_PREFLIGHT_CAP: ClassVar[int] = NODES_THRESHOLD
 
     def __init__(self, stream_config: dict, tap):
         self.stream_config = stream_config
@@ -638,7 +700,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         # Cumulative across all partitions for this stream's lifetime; get_records tracks
         # per-partition deltas for attributed logging.
         self._skipped_windows = 0
-        # Skip ConfigurableSearchCountStream.__init__ (it forces the *_search_counts name + count schema).
         SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
 
     @classmethod
@@ -710,7 +771,10 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                     raise  # genuine 4xx/auth/validation/parse error -- fail fast
                 last_exc = exc
                 elapsed = time.monotonic() - start
-                if elapsed >= max_wall_seconds:
+                next_delay = _retry_delay_seconds(exc, delay) if _is_rate_limit_failure(exc) else delay
+                if attempt == tries - 1:
+                    raise
+                if elapsed + next_delay >= max_wall_seconds:
                     self.logger.warning(
                         "GraphQL request exceeded wall-time budget %.0fs after %d attempt(s); giving up.",
                         max_wall_seconds, attempt + 1,
@@ -718,9 +782,9 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                     raise
                 self.logger.warning(
                     "GraphQL request failed (attempt %d/%d, %.1fs elapsed): %s; backing off %.1fs",
-                    attempt + 1, tries, elapsed, str(exc)[:140], delay,
+                    attempt + 1, tries, elapsed, str(exc)[:140], next_delay,
                 )
-                time.sleep(delay)
+                time.sleep(next_delay)
                 delay = min(delay * 1.8, 60.0)
         raise last_exc
 
@@ -751,7 +815,13 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 "likely a token-access issue; emitting 0 rows for this window.",
                 skipped, query,
             )
+            self._skipped_windows += 1
             return
+        if skipped:
+            self.logger.warning(
+                "Skipped %d null/inaccessible node(s) in search results for query: %s",
+                skipped, query,
+            )
 
     def _collect_pr_ids(self, query: str, api_url_base: str) -> set:
         ids: set = set()
@@ -821,14 +891,14 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         }
 
     def _process_window(self, window_query, api_url_base, instance, org, month, now, markers, reviewer):
-        ai_authored_ids: set = set()
-        for marker in markers:
-            ai_authored_ids |= self._collect_pr_ids(f"{window_query} {marker}", api_url_base)
         ai_reviewed_ids = self._collect_pr_ids(f"{window_query} {reviewer}", api_url_base) if reviewer else set()
         for node in self._iter_pr_nodes(window_query, api_url_base):
             row = self._node_to_row(node, instance, org, month, now)
             key = f"{node['repository']['nameWithOwner']}#{node['number']}"
-            row["is_ai_authored"] = key in ai_authored_ids
+            row["is_ai_authored"] = any(
+                _body_contains_marker(node.get("bodyText"), marker)
+                for marker in markers
+            )
             row["is_ai_reviewed"] = key in ai_reviewed_ids
             yield row
 
@@ -842,6 +912,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         except Exception as exc:
             if not _is_transient_graphql_failure(exc):
                 raise  # don't mask genuine bugs (parse errors, auth) -- only skip transient failures
+            if _is_rate_limit_failure(exc):
+                raise  # rate limits should pause/fail the sync, not become data gaps
             self._skipped_windows += 1
             self.logger.error(
                 "SKIPPING window after exhausted retries (%s): %s", window_query, str(exc)[:140]
@@ -849,7 +921,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             return []
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_z()
         partitions_to_process = [context] if context else self.partitions
         markers = self.stream_config.get("markers", []) or []
         reviewer = self.stream_config.get("reviewer_clause", "") or ""
@@ -871,21 +943,14 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             else:
                 self.logger.info("Month %s for %s has %d > %d results; day-slicing.", month, org, month_count, NODES_THRESHOLD)
                 for day_query in self._iter_day_queries(query):
-                    # Peak-day pre-flight: if a single day would hit/exceed the 1000-
-                    # result search cap, pagination silently truncates. Detect via a
-                    # cheap issueCount probe and skip+log loudly rather than emit a
-                    # partial day. Repo-split fallback is a documented next step.
-                    try:
-                        day_count = self._search_aggregate_count(day_query, api_url_base)
-                    except Exception as exc:
-                        # Don't crash the org over a probe failure; treat as 0 and let
-                        # _emit_window's retry/skip handle the subsequent fetch.
-                        self.logger.warning("Day-count probe failed for %s: %s", day_query, str(exc)[:140])
-                        day_count = 0
-                    if day_count >= self.DAY_PREFLIGHT_CAP:
+                    # Peak-day pre-flight: if a single day exceeds the 1000-result
+                    # search cap, pagination silently truncates. Fail the partition
+                    # when the probe cannot establish safety.
+                    day_count = self._search_aggregate_count(day_query, api_url_base)
+                    if day_count > self.DAY_PREFLIGHT_CAP:
                         self._skipped_windows += 1
                         self.logger.error(
-                            "SKIPPING day-window: count=%d >= cap=%d (search would silently truncate). "
+                            "SKIPPING day-window: count=%d > cap=%d (search would silently truncate). "
                             "Sub-slice by repo or refine the query. Window: %s",
                             day_count, self.DAY_PREFLIGHT_CAP, day_query,
                         )
@@ -903,33 +968,16 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
 VALID_STREAM_MODES = frozenset({None, "pr_velocity"})
 
-# Hosts the tap is permitted to talk to. Defense-in-depth against a misconfigured
-# scope pointing the GraphQL/REST clients at an unintended endpoint (SSRF). The
-# operator config provides api_url_base; this list is the trusted set.
-VALID_API_HOSTS = frozenset({
-    "api.github.com",       # github.com public
-    "github.a8c.com",       # Automattic GHES
-    "github.tumblr.net",    # Tumblr GHES
-})
-
 
 def validate_scope(scope: dict) -> list[str]:
     """Validate top-level scope settings (one check per scope, not per stream)."""
     errors = []
     api_url_base = scope.get("api_url_base")
     if api_url_base:
-        parsed = urlparse(api_url_base)
-        if parsed.scheme != "https":
-            errors.append(
-                f"api_url_base {api_url_base!r} must use https (got scheme={parsed.scheme!r})"
-            )
-        elif not parsed.hostname:
-            errors.append(f"api_url_base {api_url_base!r} has no hostname")
-        elif parsed.hostname not in VALID_API_HOSTS:
-            errors.append(
-                f"api_url_base host {parsed.hostname!r} not in allowlist "
-                f"{sorted(VALID_API_HOSTS)}; add the host to VALID_API_HOSTS if new"
-            )
+        try:
+            normalize_api_base_url(api_url_base)
+        except ValueError as exc:
+            errors.append(str(exc))
     return errors
 
 
@@ -952,22 +1000,37 @@ def validate_stream_config(stream_config: dict) -> list[str]:
             f"Unknown mode {mode!r}: expected one of {sorted(repr(m) for m in VALID_STREAM_MODES)} "
             f"(omit `mode` for the default count stream)"
         )
+    if mode == "pr_velocity":
+        query_template_lower = query_template.lower()
+        if not re.search(r"\b(?:type|is):pr\b", query_template_lower):
+            errors.append("pr_velocity query_template must include type:pr or is:pr")
+        if "closed:{start}..{end}" not in query_template_lower:
+            errors.append("pr_velocity query_template must include closed:{start}..{end}")
     return errors
 
 
-def _decode_search_config(tap) -> dict | None:
+def _decode_search_config() -> dict | None:
     """Simple configuration loading from environment variable."""
+    search_b64 = os.getenv("TAP_GITHUB_SEARCH_CONFIG_B64")
     search_json = os.getenv("TAP_GITHUB_SEARCH_CONFIG")
+    if search_b64 and search_json:
+        raise ValueError(
+            "Both TAP_GITHUB_SEARCH_CONFIG and TAP_GITHUB_SEARCH_CONFIG_B64 are set. "
+            "Please use only one."
+        )
+    if search_b64:
+        search_json = base64.b64decode(search_b64).decode("utf-8")
     if search_json:
         return json.loads(search_json)
+    return None
 
 
 def create_configurable_streams(tap, config_override: dict | None = None) -> list:
-    streams: list[ConfigurableSearchCountStream] = []
+    streams: list[SearchCountStreamBase] = []
     config = config_override or tap.config
     
     # Try to get search config from environment variables first
-    env_search_config = _decode_search_config(tap)
+    env_search_config = _decode_search_config()
     if env_search_config:
         tap.logger.info("Using search configuration from environment variables")
         config = dict(config)  # Make a copy

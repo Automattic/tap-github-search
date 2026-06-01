@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlparse
 
 import requests
 
 from tap_github.authenticator import (
+    AppTokenManager,
     GitHubTokenAuthenticator,
     TokenManager,
 )
+from tap_github_search.github_hosts import normalize_api_base_url
 
 
 class GHEPersonalTokenManager(TokenManager):
     """TokenManager that validates against a given API base URL (GHE-aware)."""
 
-    def __init__(self, token: str, api_base_url: str, rate_limit_buffer: int | None = None, logger: Any | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        api_base_url: str,
+        rate_limit_buffer: int | None = None,
+        logger: Any | None = None,
+    ) -> None:
         super().__init__(token, rate_limit_buffer=rate_limit_buffer, logger=logger)
         self.api_base_url = api_base_url.rstrip("/")
 
@@ -76,21 +83,7 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
                 )
         except Exception:
             pass
-        api_base_url = api_base_url.rstrip("/")
-
-        # Defense-in-depth: re-validate against the SSRF allowlist before the
-        # authenticator ever emits the PAT to this host. validate_scope() in
-        # create_configurable_streams gates the normal flow; this gate covers
-        # paths that construct a stream without going through that factory.
-        # Lazy import to avoid the circular (search_count_streams imports us).
-        from tap_github_search.search_count_streams import VALID_API_HOSTS
-        host = urlparse(api_base_url).hostname
-        if host not in VALID_API_HOSTS:
-            raise ValueError(
-                f"Refusing to authenticate to {host!r}: not in "
-                f"VALID_API_HOSTS {sorted(VALID_API_HOSTS)}"
-            )
-        return api_base_url
+        return normalize_api_base_url(api_base_url)
 
     def prepare_tokens(self) -> list[TokenManager]:  # type: ignore[override]
         env_dict = self.get_env()
@@ -101,6 +94,8 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
         personal_tokens: set[str] = set()
         if "auth_token" in self._config:
             personal_tokens.add(self._config["auth_token"])
+        if "TAP_GITHUB_SEARCH_AUTH_TOKEN" in env_dict:
+            personal_tokens.add(env_dict["TAP_GITHUB_SEARCH_AUTH_TOKEN"])
         if "additional_auth_tokens" in self._config:
             personal_tokens = personal_tokens.union(self._config["additional_auth_tokens"])
         else:
@@ -124,13 +119,33 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
             else:
                 self.logger.warning("A token was dismissed.")
 
-        # App tokens: fall back to parent behavior which contacts api.github.com
-        # This is acceptable for now; can be extended if needed for GHE app tokens.
+        app_keys: set[str] = set()
+        if "auth_app_keys" in self._config:
+            app_keys = app_keys.union(self._config["auth_app_keys"])
+        elif "GITHUB_APP_PRIVATE_KEY" in env_dict:
+            app_keys.add(env_dict["GITHUB_APP_PRIVATE_KEY"])
+
+        if app_keys and self._api_base_url != "https://api.github.com":
+            raise ValueError(
+                "GitHub App authentication is only supported for public GitHub "
+                "in tap-github-search. Use PAT auth for GitHub Enterprise."
+            )
+
         app_token_managers: list[TokenManager] = []
-        try:
-            app_token_managers = super().prepare_tokens()[len(personal_token_managers) :]
-        except Exception:
-            pass
+        for app_key in app_keys:
+            try:
+                app_token_manager = AppTokenManager(
+                    app_key,
+                    rate_limit_buffer=rate_limit_buffer,
+                    expiry_time_buffer=expiry_time_buffer,
+                    logger=self.logger,
+                )
+                if app_token_manager.is_valid_token():
+                    app_token_managers.append(app_token_manager)
+            except ValueError as exc:
+                self.logger.warning(
+                    f"An error was thrown while preparing an app token: {exc}"
+                )
 
         self.logger.info(
             f"Tap will run with {len(personal_token_managers)} personal auth tokens "

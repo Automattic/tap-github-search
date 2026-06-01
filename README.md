@@ -108,9 +108,15 @@ search:
     - name: pr_velocity
       mode: pr_velocity                        # one row per closed PR; omit for the count stream
       query_template: "org:{org} type:pr is:closed closed:{start}..{end}"
-      markers: ['"Generated with Claude Code"']  # body markers → is_ai_authored
-      reviewer_clause: "commenter:claude[bot]"   # search suffix → is_ai_reviewed
+      markers: ['"Generated with Claude Code"']  # PR body markers -> is_ai_authored
+      reviewer_clause: "reviewed-by:claude[bot]" # search suffix -> is_ai_reviewed
 ```
+
+`pr_velocity` requires a PR-only `closed:{start}..{end}` query template so it
+can split large months safely. `markers` are matched locally against the PR body
+only; use quotes when a marker should be treated as one literal phrase.
+`reviewer_clause` remains a GitHub search suffix, so use `reviewed-by:` for PR
+reviews or a deliberate `commenter:`/phrase clause when comments are the signal.
 
 For SSRF defense-in-depth, `api_url_base` is checked against an allowlist
 (`api.github.com`, `github.a8c.com`, `github.tumblr.net`) at both config-load
@@ -121,9 +127,9 @@ and authenticator-emit time. Add a host to `VALID_API_HOSTS` in
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TAP_GITHUB_SEARCH_AUTH_TOKEN` | (required) | GitHub Personal Access Token |
+| `TAP_GITHUB_SEARCH_AUTH_TOKEN` | (required unless `auth_token`/`GITHUB_TOKEN*` is set) | GitHub Personal Access Token |
 | `TAP_GITHUB_SEARCH_CONFIG_B64` | — | Base64-encoded `search` config, overrides `meltano.yml` |
-| `TAP_GITHUB_SEARCH_BATCH_SIZE` | 100 | GraphQL page size for count streams |
+| `TAP_GITHUB_SEARCH_BATCH_SIZE` | 100 | Repo-count batch size for count streams |
 | `TAP_GITHUB_SEARCH_VELOCITY_OUTER_TRIES` | 5 | Outer retry attempts on transient 5xx/INTERNAL in `pr_velocity` |
 | `TAP_GITHUB_SEARCH_VELOCITY_MAX_WALL_SECONDS` | 180 | Wall-time budget per `_robust_graphql` call (pr_velocity) |
 
@@ -181,9 +187,9 @@ Now you can test and orchestrate using Meltano:
 
 ```bash
 # Test invocation:
-meltano invoke tap-github --version
+meltano invoke tap-github-search --version
 # OR run a test `elt` pipeline:
-meltano elt tap-github target-jsonl
+meltano elt tap-github-search target-jsonl
 ```
 
 One-liner to recreate output directory, run elt, and write out state file:

@@ -5,8 +5,9 @@ venv:
   backend: uv
 plugins:
   extractors:
-  - name: tap-github
-    namespace: tap_github
+  - name: tap-github-search
+    namespace: tap_github_search
+    executable: tap-github-search
     pip_url: -e .
     capabilities:
     - state

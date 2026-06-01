@@ -8,6 +8,7 @@ on:
     - poetry.lock
     - pyproject.toml
     - 'tap_github/**'
+    - 'tap_github_search/**'
   push:
     branches:
       - main
@@ -16,6 +17,7 @@ on:
     - poetry.lock
     - pyproject.toml
     - 'tap_github/**'
+    - 'tap_github_search/**'
   workflow_dispatch:
   schedule:
   # Every 6 hours
@@ -86,7 +88,7 @@ jobs:
       id: type_check
       continue-on-error: true
       run: |
-        poetry run mypy tap_github
+        poetry run mypy tap_github tap_github_search
     - name: Test with pytest
       id: test_pytest
       continue-on-error: true

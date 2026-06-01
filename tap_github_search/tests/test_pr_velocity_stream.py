@@ -7,6 +7,8 @@ handling, and mode dispatch -- the code paths the review flagged as risky.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -20,7 +22,6 @@ from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     NODES_THRESHOLD,
     VALID_API_HOSTS,
-    VALID_STREAM_MODES,
     _hours_between,
     _instance_from_api_base,
     _is_transient_graphql_failure,
@@ -28,6 +29,7 @@ from tap_github_search.search_count_streams import (
     validate_scope,
     validate_stream_config,
 )
+from tap_github_search.tap import TapGitHubSearch
 
 
 # ---------- helpers ----------
@@ -202,6 +204,18 @@ class TestEmitWindow:
         assert result == []
         assert stream._skipped_windows == 1
 
+    def test_propagates_rate_limit_without_skip(self):
+        stream = _mk_velocity()
+        stream._skipped_windows = 0
+        rate_limited = _fatal_with_response(
+            200,
+            payload={"errors": [{"type": "RATE_LIMITED", "message": "rate limit"}]},
+        )
+        with patch.object(stream, "_process_window", side_effect=rate_limited):
+            with pytest.raises(FatalAPIError):
+                stream._emit_window("q", "https://api.github.com", "github_com", "org", "2026-04", "now", [], "")
+        assert stream._skipped_windows == 0
+
     def test_propagates_non_transient(self):
         """Genuine bugs (KeyError, auth) must NOT be silently skipped."""
         stream = _mk_velocity()
@@ -267,11 +281,11 @@ class TestGetRecordsDispatch:
         assert "closed:2026-01-01..2026-01-01" in first_day_query
 
     def test_skips_day_exceeding_preflight_cap(self):
-        """P0 #B1 -- if a day's issueCount is at/above DAY_PREFLIGHT_CAP, skip+log
+        """P0 #B1 -- if a day's issueCount is above DAY_PREFLIGHT_CAP, skip+log
         rather than silently truncate at the 1000-result search cap."""
         stream = _mk_velocity()
         # month-count > threshold (forces day-slicing), then one busy day, then small ones
-        day_counts = [NODES_THRESHOLD + 100] + [950] + [5] * 30
+        day_counts = [NODES_THRESHOLD + 100] + [NODES_THRESHOLD + 1] + [5] * 30
         with patch.object(stream, "_search_aggregate_count", side_effect=day_counts), \
              patch.object(stream, "_emit_window", return_value=[]) as fake_emit:
             partition = {
@@ -284,6 +298,69 @@ class TestGetRecordsDispatch:
         # 30 emit calls (busy day skipped), and the counter records the skip
         assert fake_emit.call_count == 30
         assert stream._skipped_windows == 1
+
+    def test_failed_day_count_probe_fails_partition(self):
+        stream = _mk_velocity()
+        with patch.object(
+            stream,
+            "_search_aggregate_count",
+            side_effect=[NODES_THRESHOLD + 1, RetriableAPIError("502", Mock(status_code=502))],
+        ), patch.object(stream, "_emit_window") as fake_emit:
+            partition = {
+                "org": "test-org",
+                "month": "2026-01",
+                "search_query": "org:test-org type:pr is:closed closed:2026-01-01..2026-01-31",
+                "api_url_base": "https://api.github.com",
+            }
+            with pytest.raises(RetriableAPIError):
+                list(stream.get_records(partition))
+        fake_emit.assert_not_called()
+
+
+class TestProcessWindow:
+    def test_body_markers_and_reviewer_clause_set_flags(self):
+        stream = _mk_velocity(
+            markers=['"Generated with Claude Code"', "openai-codex"],
+            reviewer="reviewed-by:claude[bot]",
+        )
+        nodes = [
+            {
+                "number": 1,
+                "repository": {"nameWithOwner": "test-org/repo", "name": "repo"},
+                "createdAt": "2026-04-01T00:00:00Z",
+                "closedAt": "2026-04-01T01:00:00Z",
+                "mergedAt": "2026-04-01T01:00:00Z",
+                "bodyText": "This was generated with claude code.",
+            },
+            {
+                "number": 2,
+                "repository": {"nameWithOwner": "test-org/repo", "name": "repo"},
+                "createdAt": "2026-04-01T00:00:00Z",
+                "closedAt": "2026-04-01T02:00:00Z",
+                "mergedAt": None,
+                "bodyText": "Hand-authored PR.",
+            },
+        ]
+        with patch.object(stream, "_iter_pr_nodes", return_value=iter(nodes)), \
+             patch.object(stream, "_collect_pr_ids", return_value={"test-org/repo#2"}) as collect_ids:
+            rows = list(
+                stream._process_window(
+                    "org:test-org type:pr is:closed closed:2026-04-01..2026-04-01",
+                    "https://api.github.com",
+                    "github_com",
+                    "test-org",
+                    "2026-04",
+                    "now",
+                    stream.stream_config["markers"],
+                    stream.stream_config["reviewer_clause"],
+                )
+            )
+
+        collect_ids.assert_called_once()
+        assert rows[0]["is_ai_authored"] is True
+        assert rows[0]["is_ai_reviewed"] is False
+        assert rows[1]["is_ai_authored"] is False
+        assert rows[1]["is_ai_reviewed"] is True
 
 
 class TestNodeToRow:
@@ -390,6 +467,22 @@ class TestValidateStreamConfig:
         })
         assert any("Unknown mode" in e for e in errs)
 
+    def test_rejects_pr_velocity_without_closed_range(self):
+        errs = validate_stream_config({
+            "name": "x",
+            "query_template": "org:{org} type:pr is:closed created:{start}..{end}",
+            "mode": "pr_velocity",
+        })
+        assert any("closed:{start}..{end}" in e for e in errs)
+
+    def test_rejects_pr_velocity_without_pr_qualifier(self):
+        errs = validate_stream_config({
+            "name": "x",
+            "query_template": "org:{org} is:closed closed:{start}..{end}",
+            "mode": "pr_velocity",
+        })
+        assert any("type:pr or is:pr" in e for e in errs)
+
 
 class TestValidateScope:
     """SSRF allowlist on api_url_base. Defense-in-depth against scope misconfig."""
@@ -436,7 +529,16 @@ class TestValidateScope:
             _search_cfg={"search": {"scope": {"api_url_base": "https://evil.example.com"}}},
             config={},
         )
-        with pytest.raises(ValueError, match="Refusing to authenticate"):
+        with pytest.raises(ValueError, match="not in allowlist"):
+            WrapperGitHubTokenAuthenticator._extract_api_base_url_from_stream(stream)
+
+    def test_authenticator_rejects_non_https_allowlisted_host(self):
+        from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
+        stream = SimpleNamespace(
+            _search_cfg={"search": {"scope": {"api_url_base": "http://api.github.com"}}},
+            config={},
+        )
+        with pytest.raises(ValueError, match="must use https"):
             WrapperGitHubTokenAuthenticator._extract_api_base_url_from_stream(stream)
 
     def test_authenticator_accepts_allowlisted_host(self):
@@ -448,3 +550,32 @@ class TestValidateScope:
             )
             url = WrapperGitHubTokenAuthenticator._extract_api_base_url_from_stream(stream)
             assert host in url
+
+
+class TestEnvConfig:
+    def test_b64_config_overrides_existing_search_config(self, monkeypatch):
+        file_search = {
+            "streams": [{
+                "name": "file",
+                "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
+                "mode": "pr_velocity",
+            }],
+            "scope": {"api_url_base": "https://api.github.com", "orgs": ["file-org"]},
+            "backfill": {"start_month": "2026-04"},
+        }
+        env_search = {
+            "streams": [{
+                "name": "env",
+                "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
+                "mode": "pr_velocity",
+            }],
+            "scope": {"api_url_base": "https://api.github.com", "orgs": ["env-org"]},
+            "backfill": {"start_month": "2026-04"},
+        }
+        encoded = base64.b64encode(json.dumps(env_search).encode()).decode()
+        monkeypatch.setenv("TAP_GITHUB_SEARCH_CONFIG_B64", encoded)
+
+        tap = TapGitHubSearch(config={"search": file_search})
+        streams = tap.discover_streams()
+
+        assert streams[0].stream_config["name"] == "env"

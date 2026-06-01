@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from datetime import date
-import os
-import types
 import logging
 from unittest.mock import Mock, patch
 import pytest
@@ -13,7 +11,6 @@ from tap_github_search.search_count_streams import (
     create_configurable_streams,
     validate_stream_config,
     SearchCountStreamBase,
-    BATCH_SIZE,
 )
 from tap_github_search.tap import TapGitHubSearch
 from tap_github_search.authenticator import GHEPersonalTokenManager
@@ -372,9 +369,9 @@ def test_repo_scoped_fast_path_issuecount(monkeypatch):
 
 
 @pytest.mark.parametrize("api_url_base,expected_url", [
-    ("https://github.enterprise.com/api/v3", "https://github.enterprise.com/api/graphql"),
+    ("https://github.a8c.com/api/v3", "https://github.a8c.com/api/graphql"),
     ("https://api.github.com", "https://api.github.com/graphql"),
-    ("https://github.enterprise.com/api/v3/", "https://github.enterprise.com/api/graphql"),
+    ("https://github.tumblr.net/api/v3/", "https://github.tumblr.net/api/graphql"),
 ])
 def test_graphql_url_strips_v3_for_ghes(monkeypatch, api_url_base, expected_url):
     s = _mk_stream()
