@@ -1,9 +1,12 @@
 from __future__ import annotations
+import base64
+import json
+import os
 from singer_sdk import Stream
 from tap_github.tap import TapGitHub
 from tap_github_search.search_count_streams import (
-    _decode_search_config,
     create_configurable_streams,
+    ConfigurableSearchCountStream,
 )
 
 
@@ -11,18 +14,27 @@ class TapGitHubSearch(TapGitHub):
     name = "tap-github-search"
 
     def discover_streams(self) -> list[Stream]:
-        env_search_config = _decode_search_config()
+        search_cfg_b64 = os.environ.get("TAP_GITHUB_SEARCH_CONFIG_B64")
+        search_cfg = os.environ.get("TAP_GITHUB_SEARCH_CONFIG")
 
-        if not env_search_config and "search" not in self.config:
+        if search_cfg_b64 and search_cfg:
+            raise ValueError("Both TAP_GITHUB_SEARCH_CONFIG and TAP_GITHUB_SEARCH_CONFIG_B64 are set. Please use only one.")
+
+        if search_cfg_b64:
+            search_cfg = base64.b64decode(search_cfg_b64).decode("utf-8")
+            self.logger.debug(f"Decoded TAP_GITHUB_SEARCH_CONFIG_B64: {search_cfg}")
+
+        if not search_cfg and not search_cfg_b64 and "search" not in self.config:
             raise ValueError("Provide search.* in config, set TAP_GITHUB_SEARCH_CONFIG, or set TAP_GITHUB_SEARCH_CONFIG_B64.")
 
         cfg = dict(self.config)
-        if env_search_config:
-            cfg["search"] = env_search_config
+        if search_cfg:
+            cfg["search"] = json.loads(search_cfg)
 
         streams = create_configurable_streams(self, config_override=cfg)
         for s in streams:
-            setattr(s, "_search_cfg", {"search": cfg["search"]})
+            if isinstance(s, ConfigurableSearchCountStream):
+                setattr(s, "_search_cfg", {"search": cfg["search"]})
         return streams
 
 

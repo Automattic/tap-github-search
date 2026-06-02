@@ -5,14 +5,15 @@ import json
 import logging
 from unittest.mock import patch
 
-from tap_github_search.github_hosts import DEFAULT_API_BASE_URL
+from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
 from tap_github_search.search_count_streams import (
-    ConfigurablePrVelocityStream,
     NODES_THRESHOLD,
     create_configurable_streams,
-    validate_stream_config,
 )
 from tap_github_search.tap import TapGitHubSearch
+
+
+DEFAULT_API_BASE_URL = "https://api.github.com"
 
 
 class _DummyTap:
@@ -48,20 +49,6 @@ def _mk_velocity(*, markers=None, reviewer="", instance="github_com"):
         }
     }
     return stream
-
-
-def test_pr_velocity_config_validation():
-    errors = validate_stream_config({
-        "name": "vel",
-        "query_template": "org:{org} type:pr is:closed created:{start}..{end}",
-        "mode": "pr_velocity",
-    })
-    assert any("closed:{start}..{end}" in err for err in errors)
-    assert any("Unknown mode" in err for err in validate_stream_config({
-        "name": "vel",
-        "query_template": "{org} {start} {end}",
-        "mode": "pr-velocity",
-    }))
 
 
 def test_dispatches_pr_velocity_mode():

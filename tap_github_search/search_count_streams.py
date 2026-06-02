@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import calendar
-import base64
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
 import requests
-import json
 from collections import Counter
 
 from singer_sdk import typing as th
@@ -17,15 +15,10 @@ from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
 from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
-from tap_github_search.github_hosts import (
-    DEFAULT_INSTANCE,
-    normalize_api_base_url,
-)
 
 # Essential batching configuration
 BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_BATCH_SIZE", "100"))
 NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
-
 # Regex patterns for query parsing
 ORG_PATTERN = re.compile(r"\borg:([^\s]+)")
 REPO_PATTERN = re.compile(r"\brepo:([^\s/]+)/([^\s]+)")  
@@ -37,10 +30,6 @@ from tap_github_search.utils.date_utils import (
     month_to_date,
     month_range,
 )
-
-
-def _utc_now_z() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class SearchCountStreamBase(GitHubGraphqlStream):
@@ -76,7 +65,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
         """Make a GraphQL request with standardized payload building."""
         payload = self._build_graphql_payload(query_template, variables)
-        graphql_base = normalize_api_base_url(api_url_base).removesuffix("/v3")
+        graphql_base = api_url_base.rstrip("/").removesuffix("/v3")
         prepared_request = self.build_prepared_request(method="POST", url=f"{graphql_base}/graphql", json=payload)
         decorated_request = self.request_decorator(self._request)
         return decorated_request(prepared_request, None)
@@ -421,7 +410,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         scope = s.get("scope", {})
         orgs = scope.get("orgs", [])
         repos = scope.get("repos", [])
-        api_url_base = normalize_api_base_url(scope.get("api_url_base"))
+        api_url_base = scope.get("api_url_base", "https://api.github.com")
         breakdown = scope.get("breakdown", "none") == "repo"
         if not orgs and not repos:
             self.logger.warning(f"No orgs or repos provided for {self.name}")
@@ -480,198 +469,6 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         return partitions
 
 
-VALID_STREAM_MODES = frozenset({None, "pr_velocity"})
-CLOSED_RANGE_RE = re.compile(r"closed:\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}")
-CLOSED_CAPTURE_RE = re.compile(r"closed:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
-
-
-def _hours_between(created: str | None, closed: str | None) -> float | None:
-    if not created or not closed:
-        return None
-    created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
-    closed_at = datetime.fromisoformat(closed.replace("Z", "+00:00"))
-    return round((closed_at - created_at).total_seconds() / 3600.0, 4)
-
-
-def _marker_to_literal(marker: str) -> str:
-    marker = marker.strip()
-    if len(marker) >= 2 and marker[0] == marker[-1] and marker[0] in {"'", '"'}:
-        return marker[1:-1]
-    return marker
-
-
-def _body_contains_marker(body_text: str | None, marker: str) -> bool:
-    literal = _marker_to_literal(marker)
-    return bool(literal and literal.casefold() in (body_text or "").casefold())
-
-
-class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
-    """One row per closed PR with timing and AI cohort flags."""
-
-    replication_method: ClassVar[str] = "INCREMENTAL"
-    replication_key = "month"
-    primary_keys: ClassVar[list[str]] = ["instance", "org_", "repo", "pr_number"]
-    state_partitioning_keys: ClassVar[list[str]] = ["org", "repo"]
-
-    GRAPHQL_PR_VELOCITY: ClassVar[str] = """
-    query PrVelocity($q: String!, $after: String) {
-      search(query: $q, type: ISSUE, first: 25, after: $after) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          ... on PullRequest {
-            number bodyText
-            createdAt closedAt mergedAt
-            author { login }
-            repository { name nameWithOwner }
-          }
-        }
-      }
-      rateLimit { cost remaining }
-    }
-    """
-
-    GRAPHQL_PR_IDS: ClassVar[str] = """
-    query PrIds($q: String!, $after: String) {
-      search(query: $q, type: ISSUE, first: 50, after: $after) {
-        pageInfo { hasNextPage endCursor }
-        nodes { ... on PullRequest { number repository { nameWithOwner } } }
-      }
-      rateLimit { cost remaining }
-    }
-    """
-
-    DAY_PREFLIGHT_CAP: ClassVar[int] = NODES_THRESHOLD
-
-    def __init__(self, stream_config: dict, tap):
-        self.stream_config = stream_config
-        self.query_template = stream_config["query_template"]
-        self.stream_description = stream_config.get("description", f"PR velocity stream: {stream_config['name']}")
-        self.name = stream_config["name"]
-        self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
-        self.tap = tap
-        SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
-
-    @classmethod
-    def get_schema(cls) -> dict:
-        return th.PropertiesList(
-            th.Property("instance", th.StringType, required=True),
-            th.Property("org_", th.StringType, required=True),
-            th.Property("repo", th.StringType, required=True),
-            th.Property("pr_number", th.IntegerType, required=True),
-            th.Property("author_login", th.StringType),
-            th.Property("created_at", th.DateTimeType),
-            th.Property("closed_at", th.DateTimeType),
-            th.Property("merged_at", th.DateTimeType),
-            th.Property("hours_to_close", th.NumberType),
-            th.Property("outcome", th.StringType),
-            th.Property("is_ai_authored", th.BooleanType),
-            th.Property("is_ai_reviewed", th.BooleanType),
-            th.Property("month", th.StringType),
-            th.Property("synced_at", th.DateTimeType),
-        ).to_dict()
-
-    def _scope(self) -> dict:
-        cfg_source = getattr(self, "_search_cfg", None) or self.config
-        return cfg_source.get("search", {}).get("scope", {})
-
-    def _iter_pr_nodes(self, query: str, api_url_base: str):
-        after = None
-        while True:
-            resp = self._make_graphql_request(self.GRAPHQL_PR_VELOCITY, {"q": query, "after": after}, api_url_base)
-            search = resp.json()["data"]["search"]
-            for node in search["nodes"]:
-                if node and node.get("number") is not None and node.get("repository"):
-                    yield node
-            if not search["pageInfo"]["hasNextPage"]:
-                break
-            after = search["pageInfo"]["endCursor"]
-
-    def _collect_pr_ids(self, query: str, api_url_base: str) -> set[str]:
-        ids: set[str] = set()
-        after = None
-        while True:
-            resp = self._make_graphql_request(self.GRAPHQL_PR_IDS, {"q": query, "after": after}, api_url_base)
-            search = resp.json()["data"]["search"]
-            for node in search["nodes"]:
-                if node and node.get("number") is not None and node.get("repository"):
-                    ids.add(f"{node['repository']['nameWithOwner']}#{node['number']}")
-            if not search["pageInfo"]["hasNextPage"]:
-                break
-            after = search["pageInfo"]["endCursor"]
-        return ids
-
-    def _iter_day_queries(self, query: str):
-        match = CLOSED_CAPTURE_RE.search(query)
-        if not match:
-            yield query
-            return
-        current = datetime.strptime(match.group(1), "%Y-%m-%d")
-        end = datetime.strptime(match.group(2), "%Y-%m-%d")
-        while current <= end:
-            day = current.strftime("%Y-%m-%d")
-            yield CLOSED_RANGE_RE.sub(f"closed:{day}..{day}", query)
-            current += timedelta(days=1)
-
-    def _node_to_row(self, node: dict, instance: str, org: str, month: str, now: str) -> dict:
-        repo_full = node["repository"]["nameWithOwner"]
-        repo_name = node["repository"].get("name") or repo_full.split("/")[-1]
-        merged_at = node.get("mergedAt")
-        author = node.get("author") or {}
-        return {
-            "instance": instance,
-            "org_": org,
-            "repo": repo_name,
-            "pr_number": node["number"],
-            "author_login": author.get("login"),
-            "created_at": node.get("createdAt"),
-            "closed_at": node.get("closedAt"),
-            "merged_at": merged_at,
-            "hours_to_close": _hours_between(node.get("createdAt"), node.get("closedAt")),
-            "outcome": "merged" if merged_at else "closed_unmerged",
-            "is_ai_authored": False,
-            "is_ai_reviewed": False,
-            "month": month,
-            "synced_at": now,
-        }
-
-    def _process_window(self, window_query, api_url_base, instance, org, month, now, markers, reviewer):
-        ai_reviewed_ids = self._collect_pr_ids(f"{window_query} {reviewer}", api_url_base) if reviewer else set()
-        for node in self._iter_pr_nodes(window_query, api_url_base):
-            row = self._node_to_row(node, instance, org, month, now)
-            key = f"{node['repository']['nameWithOwner']}#{node['number']}"
-            row["is_ai_authored"] = any(_body_contains_marker(node.get("bodyText"), marker) for marker in markers)
-            row["is_ai_reviewed"] = key in ai_reviewed_ids
-            yield row
-
-    def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        now = _utc_now_z()
-        partitions_to_process = [context] if context else self.partitions
-        markers = self.stream_config.get("markers", []) or []
-        reviewer = self.stream_config.get("reviewer_clause", "") or ""
-        instance = self._scope().get("instance") or DEFAULT_INSTANCE
-
-        for partition in partitions_to_process:
-            org = partition["org"]
-            month = partition["month"]
-            query = partition["search_query"]
-            api_url_base = partition["api_url_base"]
-
-            month_count = self._search_aggregate_count(query, api_url_base)
-            if month_count == 0:
-                continue
-            if month_count <= NODES_THRESHOLD:
-                yield from self._process_window(query, api_url_base, instance, org, month, now, markers, reviewer)
-            else:
-                for day_query in self._iter_day_queries(query):
-                    day_count = self._search_aggregate_count(day_query, api_url_base)
-                    if day_count > self.DAY_PREFLIGHT_CAP:
-                        raise RuntimeError(
-                            f"pr_velocity day window exceeds GitHub search cap "
-                            f"({day_count} > {self.DAY_PREFLIGHT_CAP}): {day_query}"
-                        )
-                    yield from self._process_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
-
-
 def validate_stream_config(stream_config: dict) -> list[str]:
     errors = []
     required_fields = ["name", "query_template"]
@@ -685,50 +482,13 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     for placeholder in ["{org}", "{start}", "{end}"]:
         if placeholder not in query_template:
             errors.append(f"Query template must contain {placeholder} placeholder")
-    mode = stream_config.get("mode")
-    if mode not in VALID_STREAM_MODES:
-        errors.append(
-            f"Unknown mode {mode!r}: expected one of {sorted(repr(m) for m in VALID_STREAM_MODES)} "
-            f"(omit `mode` for the default count stream)"
-        )
-    if mode == "pr_velocity":
-        query_template_lower = query_template.lower()
-        if not re.search(r"\b(?:type|is):pr\b", query_template_lower):
-            errors.append("pr_velocity query_template must include type:pr or is:pr")
-        if "closed:{start}..{end}" not in query_template_lower:
-            errors.append("pr_velocity query_template must include closed:{start}..{end}")
     return errors
-
-
-def _decode_search_config() -> dict | None:
-    """Simple configuration loading from environment variable."""
-    search_b64 = os.getenv("TAP_GITHUB_SEARCH_CONFIG_B64")
-    search_json = os.getenv("TAP_GITHUB_SEARCH_CONFIG")
-    if search_b64 and search_json:
-        raise ValueError(
-            "Both TAP_GITHUB_SEARCH_CONFIG and TAP_GITHUB_SEARCH_CONFIG_B64 are set. "
-            "Please use only one."
-        )
-    if search_b64:
-        search_json = base64.b64decode(search_b64).decode("utf-8")
-    if search_json:
-        return json.loads(search_json)
-    return None
 
 
 def create_configurable_streams(tap, config_override: dict | None = None) -> list:
     streams: list[SearchCountStreamBase] = []
     config = config_override or tap.config
-    
-    if config_override is None:
-        env_search_config = _decode_search_config()
-    else:
-        env_search_config = None
-    if env_search_config:
-        tap.logger.info("Using search configuration from environment variables")
-        config = dict(config)  # Make a copy
-        config["search"] = env_search_config
-    
+
     if "search" in config:
         s = config.get("search", {})
         for sd in s.get("streams", []):
@@ -745,6 +505,8 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
             if sd.get("mode") == "pr_velocity":
+                from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
+
                 streams.append(ConfigurablePrVelocityStream(sc, tap))
             else:
                 streams.append(ConfigurableSearchCountStream(sc, tap))

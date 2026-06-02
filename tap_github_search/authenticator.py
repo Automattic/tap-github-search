@@ -8,7 +8,6 @@ from tap_github.authenticator import (
     GitHubTokenAuthenticator,
     TokenManager,
 )
-from tap_github_search.github_hosts import normalize_api_base_url
 
 
 class GHEPersonalTokenManager(TokenManager):
@@ -76,7 +75,7 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
                 )
         except Exception:
             pass
-        return normalize_api_base_url(api_base_url)
+        return api_base_url.rstrip("/")
 
     def prepare_tokens(self) -> list[TokenManager]:  # type: ignore[override]
         env_dict = self.get_env()
@@ -110,7 +109,7 @@ class WrapperGitHubTokenAuthenticator(GitHubTokenAuthenticator):
             else:
                 self.logger.warning("A token was dismissed.")
 
-        # App tokens: fall back to parent behavior which contacts api.github.com.
+        # App tokens: fall back to parent behavior which contacts api.github.com
         # This is acceptable for now; can be extended if needed for GHE app tokens.
         app_token_managers: list[TokenManager] = []
         try:
