@@ -592,7 +592,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     replication_method: ClassVar[str] = "INCREMENTAL"
     replication_key = "month"
-    primary_keys: ClassVar[list[str]] = ["instance", "org", "repo", "pr_number"]
+    primary_keys: ClassVar[list[str]] = ["instance", "organization", "repo", "pr_number"]
     state_partitioning_keys: ClassVar[list[str]] = ["org"]
 
     GRAPHQL_PR_VELOCITY: ClassVar[str] = """
@@ -638,7 +638,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
     def get_schema(cls) -> dict:
         return th.PropertiesList(
             th.Property("instance", th.StringType, required=True),
-            th.Property("org", th.StringType, required=True),
+            th.Property("organization", th.StringType, required=True),
             th.Property("repo", th.StringType, required=True),
             th.Property("pr_number", th.IntegerType, required=True),
             th.Property("author_login", th.StringType),
@@ -739,7 +739,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         author = node.get("author") or {}
         return {
             "instance": instance,
-            "org": org,
+            "organization": org,
             "repo": repo_name,
             "pr_number": node["number"],
             "author_login": author.get("login"),
