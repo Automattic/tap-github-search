@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import date
 import logging
+from urllib.parse import urlparse
 from unittest.mock import Mock, patch
 import pytest
 import requests
 
+from tap_github_search.github_hosts import DEFAULT_API_BASE_URL, VALID_API_HOSTS
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     create_configurable_streams,
@@ -19,6 +21,12 @@ from tap_github_search.utils.date_utils import (
     month_to_date,
     get_last_complete_month,
     get_last_complete_month_date,
+)
+
+
+DEFAULT_API_HOST = urlparse(DEFAULT_API_BASE_URL).hostname or ""
+ENTERPRISE_API_HOSTS = tuple(
+    sorted(host for host in VALID_API_HOSTS if host != DEFAULT_API_HOST)
 )
 
 
@@ -40,7 +48,7 @@ def test_create_streams_from_search_namespace():
                     "query_template": "org:{org} type:issue is:open created:{start}..{end}",
                 }
             ],
-            "scope": {"api_url_base": "https://api.github.com", "orgs": ["Automattic"], "breakdown": "none"},
+            "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["example-org"], "breakdown": "none"},
             "backfill": {"start_month": "2025-01", "end_month": "2025-01"},
         }
     }
@@ -59,8 +67,8 @@ def test_query_template_substitution():
     mock_tap.config = {}
     stream = ConfigurableSearchCountStream(stream_config, mock_tap)
 
-    q = stream._build_search_query("WordPress", "2025-01-01", "2025-01-31", "issues")
-    assert q == "org:WordPress type:issue label:test created:2025-01-01..2025-01-31"
+    q = stream._build_search_query("example-org", "2025-01-01", "2025-01-31", "issues")
+    assert q == "org:example-org type:issue label:test created:2025-01-01..2025-01-31"
 
 
 # Authentication Tests
@@ -69,11 +77,12 @@ def test_ghe_token_validation_success(mock_get):
     mock_get.return_value.status_code = 200
     mock_get.return_value.raise_for_status.return_value = None
     
-    manager = GHEPersonalTokenManager("token123", "https://github.enterprise.com/api/v3")
+    api_base_url = "https://github.example.invalid/api/v3"
+    manager = GHEPersonalTokenManager("token123", api_base_url)
     assert manager.is_valid_token() == True
     
     mock_get.assert_called_once_with(
-        url="https://github.enterprise.com/api/v3/user",
+        url=f"{api_base_url}/user",
         headers={"Authorization": "token token123"}
     )
 
@@ -85,7 +94,7 @@ def test_ghe_token_validation_failure(mock_get):
     mock_get.return_value.content = b"Bad credentials"
     mock_get.return_value.raise_for_status.side_effect = requests.exceptions.HTTPError()
     
-    manager = GHEPersonalTokenManager("invalid_token", "https://github.enterprise.com/api/v3")
+    manager = GHEPersonalTokenManager("invalid_token", "https://github.example.invalid/api/v3")
     assert manager.is_valid_token() == False
 
 
@@ -93,7 +102,7 @@ def test_ghe_token_validation_failure(mock_get):
 def test_ghe_token_validation_connection_error(mock_get):
     mock_get.side_effect = requests.exceptions.ConnectionError()
     
-    manager = GHEPersonalTokenManager("token123", "https://github.enterprise.com/api/v3")
+    manager = GHEPersonalTokenManager("token123", "https://github.example.invalid/api/v3")
     assert manager.is_valid_token() == False
 
 
@@ -184,7 +193,7 @@ def test_configurable_stream_partitions_with_orgs():
         "search": {
             "scope": {
                 "orgs": ["TestOrg"],
-                "api_url_base": "https://api.github.com"
+                "api_url_base": DEFAULT_API_BASE_URL
             },
             "backfill": {
                 "start_month": "2024-01",
@@ -216,7 +225,7 @@ def test_configurable_stream_partitions_with_repos():
         "search": {
             "scope": {
                 "repos": ["TestOrg/test-repo"],
-                "api_url_base": "https://api.github.com"
+                "api_url_base": DEFAULT_API_BASE_URL
             },
             "backfill": {
                 "start_month": "2024-01", 
@@ -289,7 +298,7 @@ def test_range_passthrough(monkeypatch):
         return {"r1": 10}
 
     monkeypatch.setattr(s, "_get_repo_counts_from_nodes", fake_nodes)
-    out = s._search_with_auto_slicing("org:X is:issue created:2025-01-01..2025-01-31", "https://api.github.com")
+    out = s._search_with_auto_slicing("org:X is:issue created:2025-01-01..2025-01-31", DEFAULT_API_BASE_URL)
 
     assert calls["n"] == 1
     assert out == {"r1": 10}
@@ -308,7 +317,7 @@ def test_no_created_falls_back(monkeypatch):
         return {"rZ": 7}
 
     monkeypatch.setattr(s, "_get_repo_counts_from_nodes", fake_nodes)
-    out = s._search_with_auto_slicing("org:X is:issue label:foo", "https://api.github.com")
+    out = s._search_with_auto_slicing("org:X is:issue label:foo", DEFAULT_API_BASE_URL)
 
     assert calls["n"] == 1
     assert out == {"rZ": 7}
@@ -330,7 +339,7 @@ def test_repo_breakdown_batches_issuecount(monkeypatch):
     def fake_batch(queries, api):
         out = []
         for q in queries:
-            # q is like: repo:Automattic/rX rest...
+            # q is like: repo:example-org/rX rest...
             try:
                 repo_part = [p for p in q.split() if p.startswith("repo:")][0]
                 name = repo_part.split("/")[-1]
@@ -344,8 +353,8 @@ def test_repo_breakdown_batches_issuecount(monkeypatch):
     # Mock total count to trigger repo listing path
     monkeypatch.setattr(s, "_search_aggregate_count", lambda q, api: 2000)
 
-    q = "org:Automattic is:issue created:2025-01-01..2025-01-31"
-    out = s._search_with_repo_breakdown(q, "https://api.github.com")
+    q = "org:example-org is:issue created:2025-01-01..2025-01-31"
+    out = s._search_with_repo_breakdown(q, DEFAULT_API_BASE_URL)
 
     # Zero counts are filtered out by simplified implementation
     assert out == {"r1": 5, "r3": 3, "r4": 7, "r5": 1}
@@ -358,21 +367,29 @@ def test_repo_scoped_fast_path_issuecount(monkeypatch):
     s = _mk_stream()
 
     def fake_single(query, api):
-        assert query.startswith("repo:Automattic/calypso ")
+        assert query.startswith("repo:example-org/example-repo ")
         return 42
 
     monkeypatch.setattr(s, "_search_aggregate_count", fake_single)
 
-    q = "repo:Automattic/calypso is:issue created:2025-02-01..2025-02-28"
-    out = s._search_with_repo_breakdown(q, "https://api.github.com")
-    assert out == {"calypso": 42}
+    q = "repo:example-org/example-repo is:issue created:2025-02-01..2025-02-28"
+    out = s._search_with_repo_breakdown(q, DEFAULT_API_BASE_URL)
+    assert out == {"example-repo": 42}
 
 
-@pytest.mark.parametrize("api_url_base,expected_url", [
-    ("https://github.a8c.com/api/v3", "https://github.a8c.com/api/graphql"),
-    ("https://api.github.com", "https://api.github.com/graphql"),
-    ("https://github.tumblr.net/api/v3/", "https://github.tumblr.net/api/graphql"),
-])
+@pytest.mark.parametrize(
+    "api_url_base,expected_url",
+    [
+        (DEFAULT_API_BASE_URL, f"{DEFAULT_API_BASE_URL}/graphql"),
+        *[
+            (
+                f"https://{host}/api/v3",
+                f"https://{host}/api/graphql",
+            )
+            for host in ENTERPRISE_API_HOSTS
+        ],
+    ],
+)
 def test_graphql_url_strips_v3_for_ghes(monkeypatch, api_url_base, expected_url):
     s = _mk_stream()
     captured = {}
@@ -411,5 +428,5 @@ def test_null_nodes_skipped_in_repo_counts(monkeypatch):
 
     monkeypatch.setattr(s, "_make_graphql_request", lambda *args: mock_response)
 
-    result = s._get_repo_counts_from_nodes("org:Test type:pr", "https://api.github.com")
+    result = s._get_repo_counts_from_nodes("org:test-org type:pr", DEFAULT_API_BASE_URL)
     assert result == {"foo": 2, "bar": 1}

@@ -17,6 +17,7 @@ import pytest
 import requests
 from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 
+from tap_github_search.github_hosts import DEFAULT_API_BASE_URL, INSTANCE_BY_API_HOST
 from tap_github_search.search_count_streams import (
     ConfigurablePrVelocityStream,
     ConfigurableSearchCountStream,
@@ -33,6 +34,10 @@ from tap_github_search.tap import TapGitHubSearch
 
 
 # ---------- helpers ----------
+
+KNOWN_API_HOST = sorted(VALID_API_HOSTS)[0]
+UNKNOWN_API_BASE_URL = "https://example.invalid/api"
+
 
 class _DummyTap:
     """Minimal tap shim. Mirrors the pattern in test_search_count_streams.py."""
@@ -64,7 +69,7 @@ def _mk_velocity(*, name="pr_velocity", markers=None, reviewer="", instance="git
     stream._search_cfg = {
         "search": {
             "scope": {
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
                 "orgs": ["test-org"],
                 "instance": instance,
             },
@@ -115,7 +120,7 @@ class TestIsTransientGraphqlFailure:
         assert _is_transient_graphql_failure(exc) is True
 
     def test_fatal_with_forbidden_is_fail_fast(self):
-        """SAML / classic-PAT block (e.g. WooCommerce) -- permanent, must NOT retry."""
+        """SAML / classic-PAT block -- permanent, must NOT retry."""
         exc = _fatal_with_response(
             200,
             payload={"errors": [{"type": "FORBIDDEN", "message": "org forbids access"}]},
@@ -153,7 +158,7 @@ class TestRobustGraphqlRetry:
 
         with patch.object(stream, "_make_graphql_request", side_effect=fake_request), \
              patch("tap_github_search.search_count_streams.time.sleep") as fake_sleep:
-            result = stream._robust_graphql("q", {}, "https://api.github.com", tries=5, max_wall_seconds=1000)
+            result = stream._robust_graphql("q", {}, DEFAULT_API_BASE_URL, tries=5, max_wall_seconds=1000)
         assert result is good_resp
         assert len(calls) == 3
         assert fake_sleep.call_count == 2  # one sleep before each retry
@@ -165,7 +170,7 @@ class TestRobustGraphqlRetry:
         with patch.object(stream, "_make_graphql_request", side_effect=bad), \
              patch("tap_github_search.search_count_streams.time.sleep") as fake_sleep:
             with pytest.raises(FatalAPIError):
-                stream._robust_graphql("q", {}, "https://api.github.com", tries=5, max_wall_seconds=1000)
+                stream._robust_graphql("q", {}, DEFAULT_API_BASE_URL, tries=5, max_wall_seconds=1000)
         # Should have called exactly once -- no retries on non-transient
         assert fake_sleep.call_count == 0
 
@@ -175,7 +180,7 @@ class TestRobustGraphqlRetry:
         with patch.object(stream, "_make_graphql_request", side_effect=always_bad), \
              patch("tap_github_search.search_count_streams.time.sleep"):
             with pytest.raises(RetriableAPIError):
-                stream._robust_graphql("q", {}, "https://api.github.com", tries=3, max_wall_seconds=1000)
+                stream._robust_graphql("q", {}, DEFAULT_API_BASE_URL, tries=3, max_wall_seconds=1000)
 
     def test_aborts_when_wall_time_budget_exceeded(self):
         """Even if tries remain, an outage exceeding max_wall_seconds must give up."""
@@ -187,7 +192,7 @@ class TestRobustGraphqlRetry:
              patch("tap_github_search.search_count_streams.time.monotonic",
                    side_effect=[0, 999, 999, 999, 999, 999, 999, 999, 999, 999]):
             with pytest.raises(RetriableAPIError):
-                stream._robust_graphql("q", {}, "https://api.github.com", tries=8, max_wall_seconds=10)
+                stream._robust_graphql("q", {}, DEFAULT_API_BASE_URL, tries=8, max_wall_seconds=10)
 
 
 class TestEmitWindow:
@@ -200,7 +205,7 @@ class TestEmitWindow:
             stream, "_process_window",
             side_effect=RetriableAPIError("502", Mock(status_code=502)),
         ):
-            result = stream._emit_window("q", "https://api.github.com", "github_com", "org", "2026-04", "now", [], "")
+            result = stream._emit_window("q", DEFAULT_API_BASE_URL, "github_com", "org", "2026-04", "now", [], "")
         assert result == []
         assert stream._skipped_windows == 1
 
@@ -213,7 +218,7 @@ class TestEmitWindow:
         )
         with patch.object(stream, "_process_window", side_effect=rate_limited):
             with pytest.raises(FatalAPIError):
-                stream._emit_window("q", "https://api.github.com", "github_com", "org", "2026-04", "now", [], "")
+                stream._emit_window("q", DEFAULT_API_BASE_URL, "github_com", "org", "2026-04", "now", [], "")
         assert stream._skipped_windows == 0
 
     def test_propagates_non_transient(self):
@@ -222,7 +227,7 @@ class TestEmitWindow:
         stream._skipped_windows = 0
         with patch.object(stream, "_process_window", side_effect=KeyError("not transient")):
             with pytest.raises(KeyError):
-                stream._emit_window("q", "https://api.github.com", "github_com", "org", "2026-04", "now", [], "")
+                stream._emit_window("q", DEFAULT_API_BASE_URL, "github_com", "org", "2026-04", "now", [], "")
         assert stream._skipped_windows == 0  # counter unchanged on non-transient
 
 
@@ -237,7 +242,7 @@ class TestGetRecordsDispatch:
                 "org": "test-org",
                 "month": "2026-04",
                 "search_query": "org:test-org type:pr is:closed closed:2026-04-01..2026-04-30",
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
             }
             rows = list(stream.get_records(partition))
         assert rows == []
@@ -252,7 +257,7 @@ class TestGetRecordsDispatch:
                 "org": "test-org",
                 "month": "2026-04",
                 "search_query": "org:test-org type:pr is:closed closed:2026-04-01..2026-04-30",
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
             }
             list(stream.get_records(partition))
         # Exactly one window fetch, with the original monthly query (no day-slicing)
@@ -272,7 +277,7 @@ class TestGetRecordsDispatch:
                 "org": "test-org",
                 "month": "2026-01",
                 "search_query": "org:test-org type:pr is:closed closed:2026-01-01..2026-01-31",
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
             }
             list(stream.get_records(partition))
         # 31 day-windows for January
@@ -292,7 +297,7 @@ class TestGetRecordsDispatch:
                 "org": "test-org",
                 "month": "2026-01",
                 "search_query": "org:test-org type:pr is:closed closed:2026-01-01..2026-01-31",
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
             }
             list(stream.get_records(partition))
         # 30 emit calls (busy day skipped), and the counter records the skip
@@ -310,7 +315,7 @@ class TestGetRecordsDispatch:
                 "org": "test-org",
                 "month": "2026-01",
                 "search_query": "org:test-org type:pr is:closed closed:2026-01-01..2026-01-31",
-                "api_url_base": "https://api.github.com",
+                "api_url_base": DEFAULT_API_BASE_URL,
             }
             with pytest.raises(RetriableAPIError):
                 list(stream.get_records(partition))
@@ -346,7 +351,7 @@ class TestProcessWindow:
             rows = list(
                 stream._process_window(
                     "org:test-org type:pr is:closed closed:2026-04-01..2026-04-01",
-                    "https://api.github.com",
+                    DEFAULT_API_BASE_URL,
                     "github_com",
                     "test-org",
                     "2026-04",
@@ -405,9 +410,8 @@ class TestHoursBetween:
 
 class TestInstanceFromApiBase:
     def test_known_hosts(self):
-        assert _instance_from_api_base("https://api.github.com") == "github_com"
-        assert _instance_from_api_base("https://github.a8c.com/api/v3") == "a8c_ghe"
-        assert _instance_from_api_base("https://github.tumblr.net/api/v3") == "tumblr_ghe"
+        for host, instance in INSTANCE_BY_API_HOST.items():
+            assert _instance_from_api_base(f"https://{host}/api/v3") == instance
 
     def test_unknown_falls_back(self):
         assert _instance_from_api_base("https://example.invalid") == "unknown"
@@ -424,7 +428,7 @@ class TestCreateConfigurableStreamsModeDispatch:
                     "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
                     "mode": "pr_velocity",
                 }],
-                "scope": {"api_url_base": "https://api.github.com", "orgs": ["x"]},
+                "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["x"]},
                 "backfill": {"start_month": "2026-04"},
             }
         }
@@ -440,7 +444,7 @@ class TestCreateConfigurableStreamsModeDispatch:
                     "name": "cnt",
                     "query_template": "org:{org} is:pr is:merged merged:{start}..{end}",
                 }],
-                "scope": {"api_url_base": "https://api.github.com", "orgs": ["x"]},
+                "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["x"]},
                 "backfill": {"start_month": "2026-04"},
             }
         }
@@ -493,15 +497,15 @@ class TestValidateScope:
             assert errs == [], f"unexpected errors for known host {host}: {errs}"
 
     def test_rejects_unknown_host(self):
-        errs = validate_scope({"api_url_base": "https://evil.example.com/api"})
+        errs = validate_scope({"api_url_base": UNKNOWN_API_BASE_URL})
         assert any("not in allowlist" in e for e in errs)
 
     def test_rejects_http_scheme(self):
-        errs = validate_scope({"api_url_base": "http://api.github.com"})
+        errs = validate_scope({"api_url_base": f"http://{KNOWN_API_HOST}"})
         assert any("must use https" in e for e in errs)
 
     def test_allows_missing_api_url_base(self):
-        # api_url_base is optional; partitions() falls back to https://api.github.com
+        # api_url_base is optional; partitions() falls back to the default public API base.
         assert validate_scope({}) == []
 
     def test_create_configurable_streams_raises_on_bad_scope(self):
@@ -513,7 +517,7 @@ class TestValidateScope:
                     "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
                     "mode": "pr_velocity",
                 }],
-                "scope": {"api_url_base": "https://evil.example.com", "orgs": ["x"]},
+                "scope": {"api_url_base": UNKNOWN_API_BASE_URL, "orgs": ["x"]},
                 "backfill": {"start_month": "2026-04"},
             }
         }
@@ -526,7 +530,7 @@ class TestValidateScope:
         outside the create_configurable_streams factory."""
         from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
         stream = SimpleNamespace(
-            _search_cfg={"search": {"scope": {"api_url_base": "https://evil.example.com"}}},
+            _search_cfg={"search": {"scope": {"api_url_base": UNKNOWN_API_BASE_URL}}},
             config={},
         )
         with pytest.raises(ValueError, match="not in allowlist"):
@@ -535,7 +539,7 @@ class TestValidateScope:
     def test_authenticator_rejects_non_https_allowlisted_host(self):
         from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
         stream = SimpleNamespace(
-            _search_cfg={"search": {"scope": {"api_url_base": "http://api.github.com"}}},
+            _search_cfg={"search": {"scope": {"api_url_base": f"http://{KNOWN_API_HOST}"}}},
             config={},
         )
         with pytest.raises(ValueError, match="must use https"):
@@ -560,7 +564,7 @@ class TestEnvConfig:
                 "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
                 "mode": "pr_velocity",
             }],
-            "scope": {"api_url_base": "https://api.github.com", "orgs": ["file-org"]},
+            "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["file-org"]},
             "backfill": {"start_month": "2026-04"},
         }
         env_search = {
@@ -569,7 +573,7 @@ class TestEnvConfig:
                 "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
                 "mode": "pr_velocity",
             }],
-            "scope": {"api_url_base": "https://api.github.com", "orgs": ["env-org"]},
+            "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["env-org"]},
             "backfill": {"start_month": "2026-04"},
         }
         encoded = base64.b64encode(json.dumps(env_search).encode()).decode()
