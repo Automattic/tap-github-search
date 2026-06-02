@@ -179,11 +179,11 @@ def test_process_window_sets_minimal_fields_and_ai_flags():
         ))
 
     assert set(rows[0]) == {
-        "instance", "organization", "repo", "pr_number", "author_login", "created_at",
+        "instance", "org_", "repo", "pr_number", "author_login", "created_at",
         "closed_at", "merged_at", "hours_to_close", "outcome",
         "is_ai_authored", "is_ai_reviewed", "month", "synced_at",
     }
-    assert rows[0]["organization"] == "test-org"
+    assert rows[0]["org_"] == "test-org"
     assert rows[0]["hours_to_close"] == 1.0
     assert rows[0]["is_ai_authored"] is True
     assert rows[0]["is_ai_reviewed"] is False
