@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar, Iterable
 
 from singer_sdk import typing as th
@@ -30,6 +30,10 @@ def _hours_between(created: str | None, closed: str | None) -> float | None:
 def _body_contains_marker(body_text: str | None, marker: str) -> bool:
     literal = marker.strip().strip("'\"")
     return bool(literal and literal.casefold() in (body_text or "").casefold())
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
@@ -97,28 +101,30 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
 
     def _iter_pr_nodes(self, query: str, api_url_base: str):
         after = None
-        while True:
+        has_next = True
+        while has_next:
             resp = self._make_graphql_request(self.GRAPHQL_PR_VELOCITY, {"q": query, "after": after}, api_url_base)
             search = resp.json()["data"]["search"]
+            page_info = search["pageInfo"]
             for node in search["nodes"]:
                 if node and node.get("number") is not None and node.get("repository"):
                     yield node
-            if not search["pageInfo"]["hasNextPage"]:
-                break
-            after = search["pageInfo"]["endCursor"]
+            has_next = page_info["hasNextPage"]
+            after = page_info["endCursor"]
 
     def _collect_pr_ids(self, query: str, api_url_base: str) -> set[str]:
         ids: set[str] = set()
         after = None
-        while True:
+        has_next = True
+        while has_next:
             resp = self._make_graphql_request(self.GRAPHQL_PR_IDS, {"q": query, "after": after}, api_url_base)
             search = resp.json()["data"]["search"]
+            page_info = search["pageInfo"]
             for node in search["nodes"]:
                 if node and node.get("number") is not None and node.get("repository"):
                     ids.add(f"{node['repository']['nameWithOwner']}#{node['number']}")
-            if not search["pageInfo"]["hasNextPage"]:
-                break
-            after = search["pageInfo"]["endCursor"]
+            has_next = page_info["hasNextPage"]
+            after = page_info["endCursor"]
         return ids
 
     def _iter_day_queries(self, query: str):
@@ -162,7 +168,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             yield row
 
     def get_records(self, context: Context | None) -> Iterable[dict[str, Any]]:
-        now = datetime.utcnow().isoformat() + "Z"
+        now = _utc_now_iso()
         partitions_to_process = [context] if context else self.partitions
         markers = self.stream_config.get("markers", []) or []
         reviewer = self.stream_config.get("reviewer_clause", "") or ""
@@ -185,7 +191,10 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                     day_count = self._search_aggregate_count(day_query, api_url_base)
                     if day_count > NODES_THRESHOLD:
                         raise RuntimeError(
-                            f"pr_velocity day window exceeds GitHub search cap "
-                            f"({day_count} > {NODES_THRESHOLD}): {day_query}"
+                            "pr_velocity day window exceeds GitHub search cap: "
+                            f"GitHub GraphQL search returns at most {NODES_THRESHOLD} results per query, "
+                            f"but this day matched {day_count}. "
+                            "Narrow the configured query, for example by splitting it into repo-scoped "
+                            f"or otherwise more selective queries. Query: {day_query}"
                         )
                     yield from self._process_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)

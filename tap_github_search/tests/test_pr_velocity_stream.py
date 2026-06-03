@@ -29,6 +29,21 @@ class _DummyTap:
         pass
 
 
+class _GraphqlResponse:
+    def __init__(self, *, nodes, has_next=False, end_cursor=None):
+        self.payload = {
+            "data": {
+                "search": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                }
+            }
+        }
+
+    def json(self):
+        return self.payload
+
+
 def _mk_velocity(*, markers=None, reviewer="", instance="github_com"):
     stream_config = {
         "name": "pr_velocity",
@@ -122,6 +137,39 @@ def test_process_window_sets_minimal_fields_and_ai_flags():
     assert rows[1]["is_ai_reviewed"] is True
 
 
+def test_iter_pr_nodes_uses_end_cursor_for_next_page():
+    stream = _mk_velocity()
+    first_node = {
+        "number": 1,
+        "repository": {"nameWithOwner": "example-org/example-repo"},
+    }
+    second_node = {
+        "number": 2,
+        "repository": {"nameWithOwner": "example-org/example-repo"},
+    }
+
+    with patch.object(
+        stream,
+        "_make_graphql_request",
+        side_effect=[
+            _GraphqlResponse(
+                nodes=[first_node], has_next=True, end_cursor="cursor-one"
+            ),
+            _GraphqlResponse(nodes=[second_node], has_next=False, end_cursor=None),
+        ],
+    ) as fake_request:
+        rows = list(
+            stream._iter_pr_nodes(
+                "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+                DEFAULT_API_BASE_URL,
+            )
+        )
+
+    assert rows == [first_node, second_node]
+    assert fake_request.call_args_list[0][0][1]["after"] is None
+    assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
+
+
 def test_get_records_day_slices_when_month_exceeds_search_cap():
     stream = _mk_velocity()
     with patch.object(stream, "_search_aggregate_count", side_effect=[NODES_THRESHOLD + 1] + [5] * 30), \
@@ -149,6 +197,8 @@ def test_get_records_fails_when_single_day_exceeds_search_cap():
             }))
         except RuntimeError as exc:
             assert "exceeds GitHub search cap" in str(exc)
+            assert "GitHub GraphQL search returns at most" in str(exc)
+            assert "repo-scoped" in str(exc)
         else:
             raise AssertionError("expected over-cap day window to fail")
 
