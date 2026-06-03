@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import json
 import logging
 from unittest.mock import patch
@@ -168,6 +169,64 @@ def test_iter_pr_nodes_uses_end_cursor_for_next_page():
     assert rows == [first_node, second_node]
     assert fake_request.call_args_list[0][0][1]["after"] is None
     assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
+
+
+def test_collect_pr_ids_uses_end_cursor_for_next_page():
+    stream = _mk_velocity()
+    first_node = {
+        "number": 1,
+        "repository": {"nameWithOwner": "example-org/example-repo"},
+    }
+    second_node = {
+        "number": 2,
+        "repository": {"nameWithOwner": "example-org/example-repo"},
+    }
+
+    with patch.object(
+        stream,
+        "_make_graphql_request",
+        side_effect=[
+            _GraphqlResponse(
+                nodes=[first_node], has_next=True, end_cursor="cursor-one"
+            ),
+            _GraphqlResponse(nodes=[second_node], has_next=False, end_cursor=None),
+        ],
+    ) as fake_request:
+        ids = stream._collect_pr_ids(
+            "org:example-org type:pr is:closed reviewed-by:review-bot",
+            DEFAULT_API_BASE_URL,
+        )
+
+    assert ids == {"example-org/example-repo#1", "example-org/example-repo#2"}
+    assert fake_request.call_args_list[0][0][1]["after"] is None
+    assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
+
+
+def test_get_records_emits_json_serializable_synced_at():
+    stream = _mk_velocity()
+    node = {
+        "number": 1,
+        "repository": {"nameWithOwner": "example-org/example-repo", "name": "example-repo"},
+        "createdAt": "2026-04-01T00:00:00Z",
+        "closedAt": "2026-04-01T01:00:00Z",
+        "mergedAt": "2026-04-01T01:00:00Z",
+        "author": {"login": "author-one"},
+        "bodyText": "",
+    }
+
+    with patch.object(stream, "_search_aggregate_count", return_value=1), \
+         patch.object(stream, "_iter_pr_nodes", return_value=iter([node])):
+        row = next(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    assert isinstance(row["synced_at"], str)
+    assert row["synced_at"].endswith("Z")
+    assert datetime.fromisoformat(row["synced_at"].replace("Z", "+00:00")).tzinfo is not None
+    json.dumps(row)
 
 
 def test_get_records_day_slices_when_month_exceeds_search_cap():
