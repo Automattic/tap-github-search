@@ -8,7 +8,6 @@ from datetime import date, datetime, timedelta
 from typing import Any, ClassVar, Iterable, Mapping
 import os
 import requests
-import json
 from collections import Counter
 
 from singer_sdk import typing as th
@@ -20,7 +19,6 @@ from tap_github_search.authenticator import WrapperGitHubTokenAuthenticator
 # Essential batching configuration
 BATCH_SIZE = int(os.environ.get("TAP_GITHUB_SEARCH_BATCH_SIZE", "100"))
 NODES_THRESHOLD = 1000  # Threshold for using nodes approach vs batching
-
 # Regex patterns for query parsing
 ORG_PATTERN = re.compile(r"\borg:([^\s]+)")
 REPO_PATTERN = re.compile(r"\brepo:([^\s/]+)/([^\s]+)")  
@@ -487,24 +485,10 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     return errors
 
 
-def _decode_search_config(tap) -> dict | None:
-    """Simple configuration loading from environment variable."""
-    search_json = os.getenv("TAP_GITHUB_SEARCH_CONFIG")
-    if search_json:
-        return json.loads(search_json)
-
-
 def create_configurable_streams(tap, config_override: dict | None = None) -> list:
-    streams: list[ConfigurableSearchCountStream] = []
+    streams: list[SearchCountStreamBase] = []
     config = config_override or tap.config
-    
-    # Try to get search config from environment variables first
-    env_search_config = _decode_search_config(tap)
-    if env_search_config:
-        tap.logger.info("Using search configuration from environment variables")
-        config = dict(config)  # Make a copy
-        config["search"] = env_search_config
-    
+
     if "search" in config:
         s = config.get("search", {})
         for sd in s.get("streams", []):
@@ -512,12 +496,20 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "name": sd.get("name"),
                 "query_template": sd.get("query_template"),
                 "description": sd.get("description"),
+                "mode": sd.get("mode"),
+                "markers": sd.get("markers", []),
+                "reviewer_clause": sd.get("reviewer_clause", ""),
             }
             errors = validate_stream_config(sc)
             if errors:
                 tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
-            streams.append(ConfigurableSearchCountStream(sc, tap))
+            if sd.get("mode") == "pr_velocity":
+                from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
+
+                streams.append(ConfigurablePrVelocityStream(sc, tap))
+            else:
+                streams.append(ConfigurableSearchCountStream(sc, tap))
     else:
         tap.logger.warning("No search configuration found")
     if not streams:
