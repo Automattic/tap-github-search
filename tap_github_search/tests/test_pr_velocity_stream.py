@@ -45,6 +45,23 @@ class _GraphqlResponse:
         return self.payload
 
 
+class _RepoResponse:
+    def __init__(self, *, nodes, has_next=False, end_cursor=None):
+        self.payload = {
+            "data": {
+                "organization": {
+                    "repositories": {
+                        "nodes": nodes,
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
+                    }
+                }
+            }
+        }
+
+    def json(self):
+        return self.payload
+
+
 def _mk_velocity(*, markers=None, reviewer="", instance="github_com"):
     stream_config = {
         "name": "pr_velocity",
@@ -202,6 +219,29 @@ def test_collect_pr_ids_uses_end_cursor_for_next_page():
     assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
 
 
+def test_list_all_repos_for_org_uses_end_cursor_for_next_page():
+    stream = _mk_velocity()
+    with patch.object(
+        stream,
+        "_make_graphql_request",
+        side_effect=[
+            _RepoResponse(
+                nodes=[{"name": "repo-one"}], has_next=True, end_cursor="cursor-one"
+            ),
+            _RepoResponse(
+                nodes=[{"name": "repo-two"}],
+                has_next=False,
+                end_cursor=None,
+            ),
+        ],
+    ) as fake_request:
+        repos = stream._list_all_repos_for_org(DEFAULT_API_BASE_URL, "example-org")
+
+    assert repos == ["repo-one", "repo-two"]
+    assert fake_request.call_args_list[0][0][1]["after"] is None
+    assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
+
+
 def test_get_records_emits_json_serializable_synced_at():
     stream = _mk_velocity()
     node = {
@@ -244,20 +284,64 @@ def test_get_records_day_slices_when_month_exceeds_search_cap():
     assert "closed:2026-04-01..2026-04-01" in fake_process.call_args_list[0][0][0]
 
 
-def test_get_records_fails_when_single_day_exceeds_search_cap():
+def test_get_records_repo_slices_when_single_org_day_exceeds_search_cap():
     stream = _mk_velocity()
-    with patch.object(stream, "_search_aggregate_count", side_effect=[NODES_THRESHOLD + 1, NODES_THRESHOLD + 1]):
+
+    def count(query, _api_url_base):
+        if "closed:2026-04-01..2026-04-30" in query:
+            return NODES_THRESHOLD + 1
+        if "closed:2026-04-01..2026-04-01" in query:
+            return NODES_THRESHOLD + 1
+        return 0
+
+    with patch.object(stream, "_search_aggregate_count", side_effect=count), \
+         patch.object(
+             stream,
+             "_list_all_repos_for_org",
+             return_value=["repo-one", "repo-two"],
+         ), \
+         patch.object(
+             stream,
+             "_get_repo_counts_via_batching",
+             return_value={"repo-one": 800, "repo-two": 200},
+         ), \
+         patch.object(stream, "_process_window", return_value=[]) as fake_process:
+        list(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    assert fake_process.call_count == 2
+    assert fake_process.call_args_list[0][0][0] == (
+        "repo:example-org/repo-one type:pr is:closed closed:2026-04-01..2026-04-01"
+    )
+    assert fake_process.call_args_list[1][0][0] == (
+        "repo:example-org/repo-two type:pr is:closed closed:2026-04-01..2026-04-01"
+    )
+
+
+def test_get_records_fails_when_repo_scoped_day_exceeds_search_cap():
+    stream = _mk_velocity()
+    with patch.object(
+        stream,
+        "_search_aggregate_count",
+        side_effect=[NODES_THRESHOLD + 1, NODES_THRESHOLD + 1],
+    ):
         try:
             list(stream.get_records({
                 "org": "example-org",
                 "month": "2026-04",
-                "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+                "search_query": (
+                    "repo:example-org/big-repo type:pr is:closed "
+                    "closed:2026-04-01..2026-04-30"
+                ),
                 "api_url_base": DEFAULT_API_BASE_URL,
             }))
         except RuntimeError as exc:
-            assert "exceeds GitHub search cap" in str(exc)
+            assert "repo-scoped day window exceeds GitHub search cap" in str(exc)
             assert "GitHub GraphQL search returns at most" in str(exc)
-            assert "repo-scoped" in str(exc)
         else:
             raise AssertionError("expected over-cap day window to fail")
 

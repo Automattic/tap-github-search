@@ -12,6 +12,8 @@ from singer_sdk.helpers.types import Context
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     NODES_THRESHOLD,
+    ORG_PATTERN,
+    ORG_REPLACEMENT_PATTERN,
     SearchCountStreamBase,
 )
 
@@ -66,6 +68,18 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
       search(query: $q, type: ISSUE, first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes { ... on PullRequest { number repository { nameWithOwner } } }
+      }
+      rateLimit { cost remaining }
+    }
+    """
+
+    GRAPHQL_ORG_REPOS: ClassVar[str] = """
+    query OrgRepos($org: String!, $after: String) {
+      organization(login: $org) {
+        repositories(first: 100, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes { name }
+        }
       }
       rateLimit { cost remaining }
     }
@@ -127,6 +141,30 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             after = page_info["endCursor"]
         return ids
 
+    def _list_all_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
+        repos: list[str] = []
+        after = None
+        has_next = True
+        while has_next:
+            resp = self._make_graphql_request(
+                self.GRAPHQL_ORG_REPOS,
+                {"org": org, "after": after},
+                api_url_base,
+            )
+            organization = resp.json()["data"].get("organization")
+            if organization is None:
+                raise RuntimeError(
+                    f"Could not list repositories for organization '{org}'"
+                )
+            data = organization["repositories"]
+            repos.extend(
+                repo["name"] for repo in data["nodes"] if repo and repo.get("name")
+            )
+            page_info = data["pageInfo"]
+            has_next = page_info["hasNextPage"]
+            after = page_info["endCursor"]
+        return repos
+
     def _iter_day_queries(self, query: str):
         match = CLOSED_CAPTURE_RE.search(query)
         if not match:
@@ -138,6 +176,45 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             day = current.strftime("%Y-%m-%d")
             yield query.replace(match.group(0), f"closed:{day}..{day}")
             current += timedelta(days=1)
+
+    def _iter_repo_queries_for_capped_day(
+        self,
+        day_query: str,
+        api_url_base: str,
+        org: str,
+    ):
+        if not ORG_PATTERN.search(day_query):
+            raise RuntimeError(
+                "pr_velocity repo-scoped day window exceeds GitHub search cap: "
+                f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
+                "results per query, and this query is already scoped below "
+                f"an organization. Query: {day_query}"
+            )
+
+        repos = self._list_all_repos_for_org(api_url_base, org)
+        if not repos:
+            raise RuntimeError(
+                "Could not split capped pr_velocity day query because "
+                f"org '{org}' has no repositories"
+            )
+
+        rest_query = ORG_REPLACEMENT_PATTERN.sub("", day_query).strip()
+        repo_counts = self._get_repo_counts_via_batching(
+            repos,
+            org,
+            rest_query,
+            api_url_base,
+        )
+        for repo, count in repo_counts.items():
+            repo_query = self._build_repo_query(org, repo, rest_query)
+            if count > NODES_THRESHOLD:
+                raise RuntimeError(
+                    "pr_velocity repo-scoped day window exceeds GitHub search cap: "
+                    f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
+                    "results per query, "
+                    f"but repo '{org}/{repo}' matched {count}. Query: {repo_query}"
+                )
+            yield repo_query
 
     def _node_to_row(self, node: dict, instance: str, org: str, month: str, now: str) -> dict:
         repo_name = node["repository"].get("name") or node["repository"]["nameWithOwner"].split("/")[-1]
@@ -189,12 +266,33 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             else:
                 for day_query in self._iter_day_queries(query):
                     day_count = self._search_aggregate_count(day_query, api_url_base)
+                    if day_count == 0:
+                        continue
                     if day_count > NODES_THRESHOLD:
-                        raise RuntimeError(
-                            "pr_velocity day window exceeds GitHub search cap: "
-                            f"GitHub GraphQL search returns at most {NODES_THRESHOLD} results per query, "
-                            f"but this day matched {day_count}. "
-                            "Narrow the configured query, for example by splitting it into repo-scoped "
-                            f"or otherwise more selective queries. Query: {day_query}"
+                        repo_queries = self._iter_repo_queries_for_capped_day(
+                            day_query,
+                            api_url_base,
+                            org,
                         )
-                    yield from self._process_window(day_query, api_url_base, instance, org, month, now, markers, reviewer)
+                        for repo_query in repo_queries:
+                            yield from self._process_window(
+                                repo_query,
+                                api_url_base,
+                                instance,
+                                org,
+                                month,
+                                now,
+                                markers,
+                                reviewer,
+                            )
+                        continue
+                    yield from self._process_window(
+                        day_query,
+                        api_url_base,
+                        instance,
+                        org,
+                        month,
+                        now,
+                        markers,
+                        reviewer,
+                    )
