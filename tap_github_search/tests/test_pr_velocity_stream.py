@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import ExitStack
 from datetime import date, datetime
 import json
 import logging
@@ -350,7 +351,14 @@ def test_get_records_fails_when_repo_counts_do_not_cover_capped_day():
         )))
 
 
-def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
+@pytest.mark.parametrize("search_query", [
+    "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+    (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-01..2026-04-01"
+    ),
+])
+def test_get_records_created_slices_when_repo_day_exceeds_search_cap(search_query):
     stream = _mk_velocity()
 
     def count(query, _api_url_base):
@@ -366,52 +374,33 @@ def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
             return NODES_THRESHOLD + 1
         return 0
 
-    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", date(2026, 3, 31)), \
-         patch.object(stream, "_search_aggregate_count", side_effect=count), \
-         patch.object(
-             stream,
-             "_list_repos_for_pr_velocity",
-             return_value=["big-repo"],
-         ), \
-         patch.object(
-             stream,
-             "_get_repo_counts_via_batching",
-             return_value={"big-repo": NODES_THRESHOLD + 1},
-         ), \
-         patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records(_velocity_context(
-            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
-        )))
-
-    assert _processed_queries(fake_process) == [
-        "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31",
-        "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01",
-    ]
-
-
-def test_get_records_created_slices_when_repo_scoped_day_exceeds_search_cap():
-    stream = _mk_velocity()
-
-    def count(query, _api_url_base):
-        if "created:2026-03-31..2026-04-01" in query:
-            return NODES_THRESHOLD + 1
-        if "created:2026-03-31..2026-03-31" in query:
-            return 700
-        if "created:2026-04-01..2026-04-01" in query:
-            return 500
-        return NODES_THRESHOLD + 1
-
-    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", date(2026, 3, 31)), \
-         patch.object(stream, "_search_aggregate_count", side_effect=count), \
-         patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records(_velocity_context(
-            (
-                "repo:example-org/big-repo type:pr is:closed "
-                "closed:2026-04-01..2026-04-01"
-            )
-        )))
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE",
+            date(2026, 3, 31),
+        ))
+        stack.enter_context(patch.object(
+            stream,
+            "_search_aggregate_count",
+            side_effect=count,
+        ))
+        if search_query.startswith("org:"):
+            stack.enter_context(patch.object(
+                stream,
+                "_list_repos_for_pr_velocity",
+                return_value=["big-repo"],
+            ))
+            stack.enter_context(patch.object(
+                stream,
+                "_get_repo_counts_via_batching",
+                return_value={"big-repo": NODES_THRESHOLD + 1},
+            ))
+        fake_process = stack.enter_context(patch.object(
+            stream,
+            "_process_window",
+            return_value=[],
+        ))
+        list(stream.get_records(_velocity_context(search_query)))
 
     assert _processed_queries(fake_process) == [
         "repo:example-org/big-repo type:pr is:closed "
