@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import date, datetime
 import json
 import logging
 from unittest.mock import patch
+
+import pytest
 
 from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
 from tap_github_search.search_count_streams import (
@@ -82,6 +84,19 @@ def _mk_velocity(*, markers=None, reviewer="", instance="github_com"):
         }
     }
     return stream
+
+
+def _velocity_context(search_query):
+    return {
+        "org": "example-org",
+        "month": "2026-04",
+        "search_query": search_query,
+        "api_url_base": DEFAULT_API_BASE_URL,
+    }
+
+
+def _processed_queries(fake_process):
+    return [call.args[0] for call in fake_process.call_args_list]
 
 
 def test_dispatches_pr_velocity_mode():
@@ -256,12 +271,9 @@ def test_get_records_emits_json_serializable_synced_at():
 
     with patch.object(stream, "_search_aggregate_count", return_value=1), \
          patch.object(stream, "_iter_pr_nodes", return_value=iter([node])):
-        row = next(stream.get_records({
-            "org": "example-org",
-            "month": "2026-04",
-            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
-            "api_url_base": DEFAULT_API_BASE_URL,
-        }))
+        row = next(stream.get_records(_velocity_context(
+            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+        )))
 
     assert isinstance(row["synced_at"], str)
     assert row["synced_at"].endswith("Z")
@@ -273,15 +285,12 @@ def test_get_records_day_slices_when_month_exceeds_search_cap():
     stream = _mk_velocity()
     with patch.object(stream, "_search_aggregate_count", side_effect=[NODES_THRESHOLD + 1] + [5] * 30), \
          patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records({
-            "org": "example-org",
-            "month": "2026-04",
-            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
-            "api_url_base": DEFAULT_API_BASE_URL,
-        }))
+        list(stream.get_records(_velocity_context(
+            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+        )))
 
     assert fake_process.call_count == 30
-    assert "closed:2026-04-01..2026-04-01" in fake_process.call_args_list[0][0][0]
+    assert "closed:2026-04-01..2026-04-01" in _processed_queries(fake_process)[0]
 
 
 def test_get_records_repo_slices_when_single_org_day_exceeds_search_cap():
@@ -303,29 +312,50 @@ def test_get_records_repo_slices_when_single_org_day_exceeds_search_cap():
          patch.object(
              stream,
              "_get_repo_counts_via_batching",
-             return_value={"repo-one": 800, "repo-two": 200},
-         ), \
+             return_value={"repo-one": 800, "repo-two": 201},
+         ) as fake_repo_counts, \
          patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records({
-            "org": "example-org",
-            "month": "2026-04",
-            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
-            "api_url_base": DEFAULT_API_BASE_URL,
-        }))
+        list(stream.get_records(_velocity_context(
+            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+        )))
 
-    assert fake_process.call_count == 2
-    assert fake_process.call_args_list[0][0][0] == (
-        "repo:example-org/repo-one type:pr is:closed closed:2026-04-01..2026-04-01"
+    fake_repo_counts.assert_called_once_with(
+        ["repo-one", "repo-two"],
+        "example-org",
+        "type:pr is:closed closed:2026-04-01..2026-04-01",
+        DEFAULT_API_BASE_URL,
     )
-    assert fake_process.call_args_list[1][0][0] == (
-        "repo:example-org/repo-two type:pr is:closed closed:2026-04-01..2026-04-01"
-    )
+    assert _processed_queries(fake_process) == [
+        "repo:example-org/repo-one type:pr is:closed closed:2026-04-01..2026-04-01",
+        "repo:example-org/repo-two type:pr is:closed closed:2026-04-01..2026-04-01",
+    ]
+
+
+def test_get_records_fails_when_repo_counts_do_not_cover_capped_day():
+    stream = _mk_velocity()
+
+    def count(query, _api_url_base):
+        if "closed:2026-04-01..2026-04-30" in query:
+            return NODES_THRESHOLD + 1
+        if "closed:2026-04-01..2026-04-01" in query:
+            return NODES_THRESHOLD + 1
+        return 0
+
+    with patch.object(stream, "_search_aggregate_count", side_effect=count), \
+         patch.object(stream, "_list_all_repos_for_org", return_value=["repo-one"]), \
+         patch.object(stream, "_get_repo_counts_via_batching", return_value={"repo-one": 1}), \
+         pytest.raises(RuntimeError, match="repo split did not preserve GitHub search count"):
+        list(stream.get_records(_velocity_context(
+            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+        )))
 
 
 def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
     stream = _mk_velocity()
 
     def count(query, _api_url_base):
+        if "created:2026-03-31..2026-04-01" in query:
+            return NODES_THRESHOLD + 1
         if "created:2026-03-31..2026-03-31" in query:
             return 700
         if "created:2026-04-01..2026-04-01" in query:
@@ -336,7 +366,7 @@ def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
             return NODES_THRESHOLD + 1
         return 0
 
-    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 3, 31)), \
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", date(2026, 3, 31)), \
          patch.object(stream, "_search_aggregate_count", side_effect=count), \
          patch.object(
              stream,
@@ -349,78 +379,103 @@ def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
              return_value={"big-repo": NODES_THRESHOLD + 1},
          ), \
          patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records({
-            "org": "example-org",
-            "month": "2026-04",
-            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
-            "api_url_base": DEFAULT_API_BASE_URL,
-        }))
+        list(stream.get_records(_velocity_context(
+            "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+        )))
 
-    assert fake_process.call_count == 2
-    assert fake_process.call_args_list[0][0][0] == (
+    assert _processed_queries(fake_process) == [
         "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31"
-    )
-    assert fake_process.call_args_list[1][0][0] == (
+        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31",
         "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01"
-    )
+        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01",
+    ]
 
 
 def test_get_records_created_slices_when_repo_scoped_day_exceeds_search_cap():
     stream = _mk_velocity()
 
     def count(query, _api_url_base):
+        if "created:2026-03-31..2026-04-01" in query:
+            return NODES_THRESHOLD + 1
         if "created:2026-03-31..2026-03-31" in query:
             return 700
         if "created:2026-04-01..2026-04-01" in query:
             return 500
         return NODES_THRESHOLD + 1
 
-    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 3, 31)), \
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", date(2026, 3, 31)), \
          patch.object(stream, "_search_aggregate_count", side_effect=count), \
          patch.object(stream, "_process_window", return_value=[]) as fake_process:
-        list(stream.get_records({
-            "org": "example-org",
-            "month": "2026-04",
-            "search_query": (
+        list(stream.get_records(_velocity_context(
+            (
                 "repo:example-org/big-repo type:pr is:closed "
                 "closed:2026-04-01..2026-04-01"
-            ),
-            "api_url_base": DEFAULT_API_BASE_URL,
-        }))
+            )
+        )))
 
-    assert fake_process.call_count == 2
-    assert fake_process.call_args_list[0][0][0] == (
+    assert _processed_queries(fake_process) == [
         "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31"
-    )
-    assert fake_process.call_args_list[1][0][0] == (
+        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31",
         "repo:example-org/big-repo type:pr is:closed "
-        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01"
+        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01",
+    ]
+
+
+def test_iter_created_range_queries_recurses_until_leaf_counts_fit_cap():
+    stream = _mk_velocity()
+    base_query = (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-04..2026-04-04"
     )
+
+    def count(query, _api_url_base):
+        if "created:2026-04-01..2026-04-02" in query:
+            return NODES_THRESHOLD + 1
+        if "created:2026-04-01..2026-04-01" in query:
+            return 600
+        if "created:2026-04-02..2026-04-02" in query:
+            return 500
+        return 0
+
+    with patch.object(stream, "_search_aggregate_count", side_effect=count):
+        queries = list(stream._iter_created_range_queries(
+            base_query,
+            DEFAULT_API_BASE_URL,
+            "example-org/big-repo",
+            date(2026, 4, 1),
+            date(2026, 4, 4),
+            NODES_THRESHOLD + 1,
+        ))
+
+    assert queries == [
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-04..2026-04-04 created:2026-04-01..2026-04-01",
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-04..2026-04-04 created:2026-04-02..2026-04-02",
+    ]
+
+
+def test_get_records_fails_when_query_already_has_created_qualifier():
+    stream = _mk_velocity()
+
+    with patch.object(stream, "_search_aggregate_count", return_value=NODES_THRESHOLD + 1), \
+         pytest.raises(RuntimeError, match="already scoped by created date"):
+        list(stream.get_records(_velocity_context(
+            "repo:example-org/big-repo type:pr is:closed "
+            "closed:2026-04-01..2026-04-01 created:>=2026-03-01"
+        )))
 
 
 def test_get_records_fails_when_created_day_exceeds_search_cap():
     stream = _mk_velocity()
 
-    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 4, 1)), \
-         patch.object(stream, "_search_aggregate_count", return_value=NODES_THRESHOLD + 1):
-        try:
-            list(stream.get_records({
-                "org": "example-org",
-                "month": "2026-04",
-                "search_query": (
-                    "repo:example-org/big-repo type:pr is:closed "
-                    "closed:2026-04-01..2026-04-01"
-                ),
-                "api_url_base": DEFAULT_API_BASE_URL,
-            }))
-        except RuntimeError as exc:
-            assert "repo created-day window exceeds GitHub search cap" in str(exc)
-            assert "GitHub GraphQL search returns at most" in str(exc)
-        else:
-            raise AssertionError("expected over-cap created-day window to fail")
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", date(2026, 4, 1)), \
+         patch.object(stream, "_search_aggregate_count", return_value=NODES_THRESHOLD + 1), \
+         pytest.raises(RuntimeError, match="repo created-day window exceeds GitHub search cap"):
+        list(stream.get_records(_velocity_context(
+            "repo:example-org/big-repo type:pr is:closed "
+            "closed:2026-04-01..2026-04-01"
+        )))
 
 
 def test_b64_config_overrides_existing_search_config(monkeypatch):

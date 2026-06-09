@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Iterable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, ClassVar, Iterable, Iterator
 
 from singer_sdk import typing as th
 from singer_sdk.helpers.types import Context
@@ -12,16 +12,16 @@ from singer_sdk.helpers.types import Context
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
     NODES_THRESHOLD,
-    ORG_PATTERN,
-    ORG_REPLACEMENT_PATTERN,
-    REPO_PATTERN,
     SearchCountStreamBase,
 )
 
 DEFAULT_INSTANCE = "github_com"
 CLOSED_CAPTURE_RE = re.compile(r"closed:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
-CREATED_CAPTURE_RE = re.compile(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
-CREATED_SEARCH_START_DATE = datetime(2008, 1, 1)
+CREATED_QUALIFIER_RE = re.compile(r"(?:^|\s)-?created:")
+ORG_CAPTURE_RE = re.compile(r"(?:^|\s)org:([^\s]+)")
+ORG_QUALIFIER_RE = re.compile(r"(?:^|\s)org:[^\s]+\s*")
+REPO_CAPTURE_RE = re.compile(r"(?:^|\s)repo:([^\s/]+)/([^\s]+)")
+CREATED_SEARCH_START_DATE = date(2008, 1, 1)
 
 
 def _hours_between(created: str | None, closed: str | None) -> float | None:
@@ -95,6 +95,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self.name = stream_config["name"]
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
         self.tap = tap
+        self._org_repo_cache: dict[tuple[str, str], list[str]] = {}
         SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
 
     @classmethod
@@ -145,6 +146,11 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         return ids
 
     def _list_all_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
+        """List org repos without filtering, preserving org: search semantics."""
+        cache_key = (api_url_base, org)
+        if cache_key in self._org_repo_cache:
+            return self._org_repo_cache[cache_key]
+
         repos: list[str] = []
         after = None
         has_next = True
@@ -166,19 +172,47 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             page_info = data["pageInfo"]
             has_next = page_info["hasNextPage"]
             after = page_info["endCursor"]
+        self._org_repo_cache[cache_key] = repos
         return repos
 
-    def _iter_day_queries(self, query: str):
+    def _iter_day_queries(self, query: str) -> Iterator[str]:
         match = CLOSED_CAPTURE_RE.search(query)
         if not match:
             yield query
             return
-        current = datetime.strptime(match.group(1), "%Y-%m-%d")
-        end = datetime.strptime(match.group(2), "%Y-%m-%d")
+        current = date.fromisoformat(match.group(1))
+        end = date.fromisoformat(match.group(2))
         while current <= end:
-            day = current.strftime("%Y-%m-%d")
+            day = current.isoformat()
             yield query.replace(match.group(0), f"closed:{day}..{day}")
             current += timedelta(days=1)
+
+    def _iter_processable_queries(
+        self,
+        query: str,
+        api_url_base: str,
+        org: str,
+    ) -> Iterator[str]:
+        month_count = self._search_aggregate_count(query, api_url_base)
+        if month_count == 0:
+            return
+        if month_count <= NODES_THRESHOLD:
+            yield query
+            return
+
+        for day_query in self._iter_day_queries(query):
+            day_count = self._search_aggregate_count(day_query, api_url_base)
+            if day_count == 0:
+                continue
+            if day_count <= NODES_THRESHOLD:
+                yield day_query
+                continue
+            yield from self._iter_repo_queries_for_capped_day(
+                day_query,
+                api_url_base,
+                org,
+                day_count,
+            )
 
     def _iter_repo_queries_for_capped_day(
         self,
@@ -186,8 +220,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         api_url_base: str,
         org: str,
         day_count: int,
-    ):
-        repo_match = REPO_PATTERN.search(day_query)
+    ) -> Iterator[str]:
+        repo_match = REPO_CAPTURE_RE.search(day_query)
         if repo_match:
             repo_label = f"{repo_match.group(1)}/{repo_match.group(2)}"
             yield from self._iter_created_range_queries_for_capped_repo_day(
@@ -198,7 +232,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             )
             return
 
-        if not ORG_PATTERN.search(day_query):
+        org_match = ORG_CAPTURE_RE.search(day_query)
+        if not org_match:
             raise RuntimeError(
                 "pr_velocity repo-scoped day window exceeds GitHub search cap: "
                 f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
@@ -206,6 +241,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 f"an organization. Query: {day_query}"
             )
 
+        org = org_match.group(1)
         repos = self._list_all_repos_for_org(api_url_base, org)
         if not repos:
             raise RuntimeError(
@@ -213,12 +249,18 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 f"org '{org}' has no repositories"
             )
 
-        rest_query = ORG_REPLACEMENT_PATTERN.sub("", day_query).strip()
+        rest_query = ORG_QUALIFIER_RE.sub(" ", day_query).strip()
         repo_counts = self._get_repo_counts_via_batching(
             repos,
             org,
             rest_query,
             api_url_base,
+        )
+        self._ensure_split_count_matches(
+            "repo",
+            day_query,
+            expected=day_count,
+            actual=sum(repo_counts.values()),
         )
         for repo, count in repo_counts.items():
             repo_query = self._build_repo_query(org, repo, rest_query)
@@ -238,8 +280,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         api_url_base: str,
         repo_label: str,
         repo_day_count: int,
-    ):
-        if CREATED_CAPTURE_RE.search(repo_query):
+    ) -> Iterator[str]:
+        if CREATED_QUALIFIER_RE.search(repo_query):
             raise RuntimeError(
                 "pr_velocity created-date window exceeds GitHub search cap: "
                 f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
@@ -254,10 +296,22 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 f"because it is not scoped to a single closed day. Query: {repo_query}"
             )
 
-        closed_day = datetime.strptime(match.group(1), "%Y-%m-%d")
+        closed_day = date.fromisoformat(match.group(1))
         self.logger.info(
             "Repo-scoped pr_velocity day exceeded search cap; splitting by "
             f"created date for repo '{repo_label}'"
+        )
+        created_query = self._append_created_range(
+            repo_query,
+            CREATED_SEARCH_START_DATE,
+            closed_day,
+        )
+        created_count = self._search_aggregate_count(created_query, api_url_base)
+        self._ensure_split_count_matches(
+            "created-date",
+            created_query,
+            expected=repo_day_count,
+            actual=created_count,
         )
         yield from self._iter_created_range_queries(
             repo_query,
@@ -265,7 +319,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             repo_label,
             CREATED_SEARCH_START_DATE,
             closed_day,
-            repo_day_count,
+            created_count,
         )
 
     def _iter_created_range_queries(
@@ -273,10 +327,10 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         base_query: str,
         api_url_base: str,
         repo_label: str,
-        start: datetime,
-        end: datetime,
+        start: date,
+        end: date,
         count: int,
-    ):
+    ) -> Iterator[str]:
         if count == 0:
             return
 
@@ -296,32 +350,35 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         midpoint = start + timedelta(days=(end - start).days // 2)
         right_start = midpoint + timedelta(days=1)
 
-        left_query = self._append_created_range(base_query, start, midpoint)
-        left_count = self._search_aggregate_count(left_query, api_url_base)
-        yield from self._iter_created_range_queries(
-            base_query,
-            api_url_base,
-            repo_label,
-            start,
-            midpoint,
-            left_count,
-        )
+        for child_start, child_end in ((start, midpoint), (right_start, end)):
+            child_query = self._append_created_range(base_query, child_start, child_end)
+            child_count = self._search_aggregate_count(child_query, api_url_base)
+            yield from self._iter_created_range_queries(
+                base_query,
+                api_url_base,
+                repo_label,
+                child_start,
+                child_end,
+                child_count,
+            )
 
-        right_query = self._append_created_range(base_query, right_start, end)
-        right_count = self._search_aggregate_count(right_query, api_url_base)
-        yield from self._iter_created_range_queries(
-            base_query,
-            api_url_base,
-            repo_label,
-            right_start,
-            end,
-            right_count,
-        )
+    def _append_created_range(self, query: str, start: date, end: date) -> str:
+        return f"{query} created:{start.isoformat()}..{end.isoformat()}"
 
-    def _append_created_range(self, query: str, start: datetime, end: datetime) -> str:
-        return (
-            f"{query} created:{start.strftime('%Y-%m-%d')}.."
-            f"{end.strftime('%Y-%m-%d')}"
+    def _ensure_split_count_matches(
+        self,
+        split_name: str,
+        query: str,
+        *,
+        expected: int,
+        actual: int,
+    ) -> None:
+        if actual == expected:
+            return
+        raise RuntimeError(
+            f"pr_velocity {split_name} split did not preserve GitHub search "
+            f"count: parent matched {expected}, split matched {actual}. "
+            f"Query: {query}"
         )
 
     def _node_to_row(self, node: dict, instance: str, org: str, month: str, now: str) -> dict:
@@ -366,42 +423,14 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             query = partition["search_query"]
             api_url_base = partition["api_url_base"]
 
-            month_count = self._search_aggregate_count(query, api_url_base)
-            if month_count == 0:
-                continue
-            if month_count <= NODES_THRESHOLD:
-                yield from self._process_window(query, api_url_base, instance, org, month, now, markers, reviewer)
-            else:
-                for day_query in self._iter_day_queries(query):
-                    day_count = self._search_aggregate_count(day_query, api_url_base)
-                    if day_count == 0:
-                        continue
-                    if day_count > NODES_THRESHOLD:
-                        repo_queries = self._iter_repo_queries_for_capped_day(
-                            day_query,
-                            api_url_base,
-                            org,
-                            day_count,
-                        )
-                        for repo_query in repo_queries:
-                            yield from self._process_window(
-                                repo_query,
-                                api_url_base,
-                                instance,
-                                org,
-                                month,
-                                now,
-                                markers,
-                                reviewer,
-                            )
-                        continue
-                    yield from self._process_window(
-                        day_query,
-                        api_url_base,
-                        instance,
-                        org,
-                        month,
-                        now,
-                        markers,
-                        reviewer,
-                    )
+            for window_query in self._iter_processable_queries(query, api_url_base, org):
+                yield from self._process_window(
+                    window_query,
+                    api_url_base,
+                    instance,
+                    org,
+                    month,
+                    now,
+                    markers,
+                    reviewer,
+                )
