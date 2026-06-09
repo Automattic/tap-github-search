@@ -76,18 +76,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
     }
     """
 
-    GRAPHQL_ORG_REPOS: ClassVar[str] = """
-    query OrgRepos($org: String!, $after: String) {
-      organization(login: $org) {
-        repositories(first: 100, after: $after) {
-          pageInfo { hasNextPage endCursor }
-          nodes { name }
-        }
-      }
-      rateLimit { cost remaining }
-    }
-    """
-
     def __init__(self, stream_config: dict, tap):
         self.stream_config = stream_config
         self.query_template = stream_config["query_template"]
@@ -145,33 +133,13 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             after = page_info["endCursor"]
         return ids
 
-    def _list_all_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
-        """List org repos without filtering, preserving org: search semantics."""
+    def _list_repos_for_pr_velocity(self, api_url_base: str, org: str) -> list[str]:
+        """Preserve org: search semantics by including archived and forked repos."""
         cache_key = (api_url_base, org)
         if cache_key in self._org_repo_cache:
             return self._org_repo_cache[cache_key]
 
-        repos: list[str] = []
-        after = None
-        has_next = True
-        while has_next:
-            resp = self._make_graphql_request(
-                self.GRAPHQL_ORG_REPOS,
-                {"org": org, "after": after},
-                api_url_base,
-            )
-            organization = resp.json()["data"].get("organization")
-            if organization is None:
-                raise RuntimeError(
-                    f"Could not list repositories for organization '{org}'"
-                )
-            data = organization["repositories"]
-            repos.extend(
-                repo["name"] for repo in data["nodes"] if repo and repo.get("name")
-            )
-            page_info = data["pageInfo"]
-            has_next = page_info["hasNextPage"]
-            after = page_info["endCursor"]
+        repos = self._list_repos_for_org(api_url_base, org, include_inactive=True)
         self._org_repo_cache[cache_key] = repos
         return repos
 
@@ -224,7 +192,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         repo_match = REPO_CAPTURE_RE.search(day_query)
         if repo_match:
             repo_label = f"{repo_match.group(1)}/{repo_match.group(2)}"
-            yield from self._iter_created_range_queries_for_capped_repo_day(
+            yield from self._iter_created_range_queries_for_capped_day(
                 day_query,
                 api_url_base,
                 repo_label,
@@ -242,7 +210,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             )
 
         org = org_match.group(1)
-        repos = self._list_all_repos_for_org(api_url_base, org)
+        repos = self._list_repos_for_pr_velocity(api_url_base, org)
         if not repos:
             raise RuntimeError(
                 "Could not split capped pr_velocity day query because "
@@ -265,7 +233,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         for repo, count in repo_counts.items():
             repo_query = self._build_repo_query(org, repo, rest_query)
             if count > NODES_THRESHOLD:
-                yield from self._iter_created_range_queries_for_capped_repo_day(
+                yield from self._iter_created_range_queries_for_capped_day(
                     repo_query,
                     api_url_base,
                     f"{org}/{repo}",
@@ -274,7 +242,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                 continue
             yield repo_query
 
-    def _iter_created_range_queries_for_capped_repo_day(
+    def _iter_created_range_queries_for_capped_day(
         self,
         repo_query: str,
         api_url_base: str,
@@ -339,6 +307,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             yield query
             return
 
+        # No narrower date-only split exists for one repo on one created day.
         if start >= end:
             raise RuntimeError(
                 "pr_velocity repo created-day window exceeds GitHub search cap: "
@@ -375,6 +344,8 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
     ) -> None:
         if actual == expected:
             return
+        # Historical counts should be stable; near-live windows may fail loudly
+        # if GitHub search counts change between parent and child queries.
         raise RuntimeError(
             f"pr_velocity {split_name} split did not preserve GitHub search "
             f"count: parent matched {expected}, split matched {actual}. "

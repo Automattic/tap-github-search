@@ -234,7 +234,7 @@ def test_collect_pr_ids_uses_end_cursor_for_next_page():
     assert fake_request.call_args_list[1][0][1]["after"] == "cursor-one"
 
 
-def test_list_all_repos_for_org_uses_end_cursor_for_next_page():
+def test_pr_velocity_repo_listing_uses_end_cursor_for_next_page():
     stream = _mk_velocity()
     with patch.object(
         stream,
@@ -250,7 +250,7 @@ def test_list_all_repos_for_org_uses_end_cursor_for_next_page():
             ),
         ],
     ) as fake_request:
-        repos = stream._list_all_repos_for_org(DEFAULT_API_BASE_URL, "example-org")
+        repos = stream._list_repos_for_pr_velocity(DEFAULT_API_BASE_URL, "example-org")
 
     assert repos == ["repo-one", "repo-two"]
     assert fake_request.call_args_list[0][0][1]["after"] is None
@@ -306,7 +306,7 @@ def test_get_records_repo_slices_when_single_org_day_exceeds_search_cap():
     with patch.object(stream, "_search_aggregate_count", side_effect=count), \
          patch.object(
              stream,
-             "_list_all_repos_for_org",
+             "_list_repos_for_pr_velocity",
              return_value=["repo-one", "repo-two"],
          ), \
          patch.object(
@@ -342,7 +342,7 @@ def test_get_records_fails_when_repo_counts_do_not_cover_capped_day():
         return 0
 
     with patch.object(stream, "_search_aggregate_count", side_effect=count), \
-         patch.object(stream, "_list_all_repos_for_org", return_value=["repo-one"]), \
+         patch.object(stream, "_list_repos_for_pr_velocity", return_value=["repo-one"]), \
          patch.object(stream, "_get_repo_counts_via_batching", return_value={"repo-one": 1}), \
          pytest.raises(RuntimeError, match="repo split did not preserve GitHub search count"):
         list(stream.get_records(_velocity_context(
@@ -370,7 +370,7 @@ def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
          patch.object(stream, "_search_aggregate_count", side_effect=count), \
          patch.object(
              stream,
-             "_list_all_repos_for_org",
+             "_list_repos_for_pr_velocity",
              return_value=["big-repo"],
          ), \
          patch.object(

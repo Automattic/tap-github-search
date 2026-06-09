@@ -353,8 +353,14 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             current = slice_end + timedelta(days=1)
         return dict(repo_counts)
 
-    def _list_repos_for_org(self, api_url_base: str, org: str) -> list[str]:
-        """List active repositories for an organization."""
+    def _list_repos_for_org(
+        self,
+        api_url_base: str,
+        org: str,
+        *,
+        include_inactive: bool = False,
+    ) -> list[str]:
+        """List repositories for an organization."""
         query = """
         query($org:String!, $after:String){
           organization(login:$org){
@@ -374,11 +380,17 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         
         while True:
             resp = self._make_graphql_request(query, {"org": org, "after": after}, api_url_base)
-            data = resp.json()["data"]["organization"]["repositories"]
+            organization = resp.json()["data"].get("organization")
+            if organization is None:
+                raise RuntimeError(f"Could not list repositories for organization '{org}'")
+            data = organization["repositories"]
             
-            # Filter out forks and archived repos
-            active_repos = self._filter_active_repos(data["nodes"])
-            names.extend(active_repos)
+            if include_inactive:
+                names.extend(
+                    repo["name"] for repo in data["nodes"] if repo and repo.get("name")
+                )
+            else:
+                names.extend(self._filter_active_repos(data["nodes"]))
             
             if not data["pageInfo"]["hasNextPage"]:
                 break
