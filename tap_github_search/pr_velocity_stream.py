@@ -21,6 +21,8 @@ CREATED_QUALIFIER_RE = re.compile(r"(?:^|\s)-?created:")
 ORG_CAPTURE_RE = re.compile(r"(?:^|\s)org:([^\s]+)")
 ORG_QUALIFIER_RE = re.compile(r"(?:^|\s)org:[^\s]+\s*")
 REPO_CAPTURE_RE = re.compile(r"(?:^|\s)repo:([^\s/]+)/([^\s]+)")
+# GitHub launched in 2008, so no PR can predate this; it is a safe lower bound
+# for the created-date range that captures every PR closed on a given day.
 CREATED_SEARCH_START_DATE = date(2008, 1, 1)
 
 
@@ -159,7 +161,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self,
         query: str,
         api_url_base: str,
-        org: str,
     ) -> Iterator[str]:
         month_count = self._search_aggregate_count(query, api_url_base)
         if month_count == 0:
@@ -178,7 +179,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             yield from self._iter_repo_queries_for_capped_day(
                 day_query,
                 api_url_base,
-                org,
                 day_count,
             )
 
@@ -186,7 +186,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self,
         day_query: str,
         api_url_base: str,
-        org: str,
         day_count: int,
     ) -> Iterator[str]:
         repo_match = REPO_CAPTURE_RE.search(day_query)
@@ -203,10 +202,10 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         org_match = ORG_CAPTURE_RE.search(day_query)
         if not org_match:
             raise RuntimeError(
-                "pr_velocity repo-scoped day window exceeds GitHub search cap: "
+                "pr_velocity day window exceeds GitHub search cap: "
                 f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
-                "results per query, and this query is already scoped below "
-                f"an organization. Query: {day_query}"
+                "results per query, but this query has no org: or repo: "
+                f"qualifier to split on. Query: {day_query}"
             )
 
         org = org_match.group(1)
@@ -394,7 +393,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             query = partition["search_query"]
             api_url_base = partition["api_url_base"]
 
-            for window_query in self._iter_processable_queries(query, api_url_base, org):
+            for window_query in self._iter_processable_queries(query, api_url_base):
                 yield from self._process_window(
                     window_query,
                     api_url_base,
