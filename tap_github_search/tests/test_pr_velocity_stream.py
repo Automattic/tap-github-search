@@ -322,28 +322,105 @@ def test_get_records_repo_slices_when_single_org_day_exceeds_search_cap():
     )
 
 
-def test_get_records_fails_when_repo_scoped_day_exceeds_search_cap():
+def test_get_records_created_slices_when_org_repo_day_exceeds_search_cap():
     stream = _mk_velocity()
-    with patch.object(
-        stream,
-        "_search_aggregate_count",
-        side_effect=[NODES_THRESHOLD + 1, NODES_THRESHOLD + 1],
-    ):
+
+    def count(query, _api_url_base):
+        if "created:2026-03-31..2026-03-31" in query:
+            return 700
+        if "created:2026-04-01..2026-04-01" in query:
+            return 500
+        if "closed:2026-04-01..2026-04-30" in query:
+            return NODES_THRESHOLD + 1
+        if "closed:2026-04-01..2026-04-01" in query:
+            return NODES_THRESHOLD + 1
+        return 0
+
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 3, 31)), \
+         patch.object(stream, "_search_aggregate_count", side_effect=count), \
+         patch.object(
+             stream,
+             "_list_all_repos_for_org",
+             return_value=["big-repo"],
+         ), \
+         patch.object(
+             stream,
+             "_get_repo_counts_via_batching",
+             return_value={"big-repo": NODES_THRESHOLD + 1},
+         ), \
+         patch.object(stream, "_process_window", return_value=[]) as fake_process:
+        list(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    assert fake_process.call_count == 2
+    assert fake_process.call_args_list[0][0][0] == (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31"
+    )
+    assert fake_process.call_args_list[1][0][0] == (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01"
+    )
+
+
+def test_get_records_created_slices_when_repo_scoped_day_exceeds_search_cap():
+    stream = _mk_velocity()
+
+    def count(query, _api_url_base):
+        if "created:2026-03-31..2026-03-31" in query:
+            return 700
+        if "created:2026-04-01..2026-04-01" in query:
+            return 500
+        return NODES_THRESHOLD + 1
+
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 3, 31)), \
+         patch.object(stream, "_search_aggregate_count", side_effect=count), \
+         patch.object(stream, "_process_window", return_value=[]) as fake_process:
+        list(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": (
+                "repo:example-org/big-repo type:pr is:closed "
+                "closed:2026-04-01..2026-04-01"
+            ),
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    assert fake_process.call_count == 2
+    assert fake_process.call_args_list[0][0][0] == (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-01..2026-04-01 created:2026-03-31..2026-03-31"
+    )
+    assert fake_process.call_args_list[1][0][0] == (
+        "repo:example-org/big-repo type:pr is:closed "
+        "closed:2026-04-01..2026-04-01 created:2026-04-01..2026-04-01"
+    )
+
+
+def test_get_records_fails_when_created_day_exceeds_search_cap():
+    stream = _mk_velocity()
+
+    with patch("tap_github_search.pr_velocity_stream.CREATED_SEARCH_START_DATE", datetime(2026, 4, 1)), \
+         patch.object(stream, "_search_aggregate_count", return_value=NODES_THRESHOLD + 1):
         try:
             list(stream.get_records({
                 "org": "example-org",
                 "month": "2026-04",
                 "search_query": (
                     "repo:example-org/big-repo type:pr is:closed "
-                    "closed:2026-04-01..2026-04-30"
+                    "closed:2026-04-01..2026-04-01"
                 ),
                 "api_url_base": DEFAULT_API_BASE_URL,
             }))
         except RuntimeError as exc:
-            assert "repo-scoped day window exceeds GitHub search cap" in str(exc)
+            assert "repo created-day window exceeds GitHub search cap" in str(exc)
             assert "GitHub GraphQL search returns at most" in str(exc)
         else:
-            raise AssertionError("expected over-cap day window to fail")
+            raise AssertionError("expected over-cap created-day window to fail")
 
 
 def test_b64_config_overrides_existing_search_config(monkeypatch):

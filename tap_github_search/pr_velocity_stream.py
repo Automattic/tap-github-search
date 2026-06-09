@@ -14,11 +14,14 @@ from tap_github_search.search_count_streams import (
     NODES_THRESHOLD,
     ORG_PATTERN,
     ORG_REPLACEMENT_PATTERN,
+    REPO_PATTERN,
     SearchCountStreamBase,
 )
 
 DEFAULT_INSTANCE = "github_com"
 CLOSED_CAPTURE_RE = re.compile(r"closed:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
+CREATED_CAPTURE_RE = re.compile(r"created:(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
+CREATED_SEARCH_START_DATE = datetime(2008, 1, 1)
 
 
 def _hours_between(created: str | None, closed: str | None) -> float | None:
@@ -182,7 +185,19 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         day_query: str,
         api_url_base: str,
         org: str,
+        day_count: int,
     ):
+        repo_match = REPO_PATTERN.search(day_query)
+        if repo_match:
+            repo_label = f"{repo_match.group(1)}/{repo_match.group(2)}"
+            yield from self._iter_created_range_queries_for_capped_repo_day(
+                day_query,
+                api_url_base,
+                repo_label,
+                day_count,
+            )
+            return
+
         if not ORG_PATTERN.search(day_query):
             raise RuntimeError(
                 "pr_velocity repo-scoped day window exceeds GitHub search cap: "
@@ -208,13 +223,106 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         for repo, count in repo_counts.items():
             repo_query = self._build_repo_query(org, repo, rest_query)
             if count > NODES_THRESHOLD:
-                raise RuntimeError(
-                    "pr_velocity repo-scoped day window exceeds GitHub search cap: "
-                    f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
-                    "results per query, "
-                    f"but repo '{org}/{repo}' matched {count}. Query: {repo_query}"
+                yield from self._iter_created_range_queries_for_capped_repo_day(
+                    repo_query,
+                    api_url_base,
+                    f"{org}/{repo}",
+                    count,
                 )
+                continue
             yield repo_query
+
+    def _iter_created_range_queries_for_capped_repo_day(
+        self,
+        repo_query: str,
+        api_url_base: str,
+        repo_label: str,
+        repo_day_count: int,
+    ):
+        if CREATED_CAPTURE_RE.search(repo_query):
+            raise RuntimeError(
+                "pr_velocity created-date window exceeds GitHub search cap: "
+                f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
+                "results per query, and this query is already scoped by "
+                f"created date. Query: {repo_query}"
+            )
+
+        match = CLOSED_CAPTURE_RE.search(repo_query)
+        if not match or match.group(1) != match.group(2):
+            raise RuntimeError(
+                "Could not split capped pr_velocity repo query by created date "
+                f"because it is not scoped to a single closed day. Query: {repo_query}"
+            )
+
+        closed_day = datetime.strptime(match.group(1), "%Y-%m-%d")
+        self.logger.info(
+            "Repo-scoped pr_velocity day exceeded search cap; splitting by "
+            f"created date for repo '{repo_label}'"
+        )
+        yield from self._iter_created_range_queries(
+            repo_query,
+            api_url_base,
+            repo_label,
+            CREATED_SEARCH_START_DATE,
+            closed_day,
+            repo_day_count,
+        )
+
+    def _iter_created_range_queries(
+        self,
+        base_query: str,
+        api_url_base: str,
+        repo_label: str,
+        start: datetime,
+        end: datetime,
+        count: int,
+    ):
+        if count == 0:
+            return
+
+        query = self._append_created_range(base_query, start, end)
+        if count <= NODES_THRESHOLD:
+            yield query
+            return
+
+        if start >= end:
+            raise RuntimeError(
+                "pr_velocity repo created-day window exceeds GitHub search cap: "
+                f"GitHub GraphQL search returns at most {NODES_THRESHOLD} "
+                "results per query, "
+                f"but repo '{repo_label}' matched {count}. Query: {query}"
+            )
+
+        midpoint = start + timedelta(days=(end - start).days // 2)
+        right_start = midpoint + timedelta(days=1)
+
+        left_query = self._append_created_range(base_query, start, midpoint)
+        left_count = self._search_aggregate_count(left_query, api_url_base)
+        yield from self._iter_created_range_queries(
+            base_query,
+            api_url_base,
+            repo_label,
+            start,
+            midpoint,
+            left_count,
+        )
+
+        right_query = self._append_created_range(base_query, right_start, end)
+        right_count = self._search_aggregate_count(right_query, api_url_base)
+        yield from self._iter_created_range_queries(
+            base_query,
+            api_url_base,
+            repo_label,
+            right_start,
+            end,
+            right_count,
+        )
+
+    def _append_created_range(self, query: str, start: datetime, end: datetime) -> str:
+        return (
+            f"{query} created:{start.strftime('%Y-%m-%d')}.."
+            f"{end.strftime('%Y-%m-%d')}"
+        )
 
     def _node_to_row(self, node: dict, instance: str, org: str, month: str, now: str) -> dict:
         repo_name = node["repository"].get("name") or node["repository"]["nameWithOwner"].split("/")[-1]
@@ -273,6 +381,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
                             day_query,
                             api_url_base,
                             org,
+                            day_count,
                         )
                         for repo_query in repo_queries:
                             yield from self._process_window(
