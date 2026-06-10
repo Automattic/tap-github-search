@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, ClassVar, Iterable
 
 from singer_sdk import typing as th
@@ -77,6 +77,7 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self.stream_description = stream_config.get("description", f"PR velocity stream: {stream_config['name']}")
         self.name = stream_config["name"]
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
+        self.max_pr_age_days = stream_config.get("max_pr_age_days")
         self.tap = tap
         SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
 
@@ -180,6 +181,11 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
             month = partition["month"]
             query = partition["search_query"]
             api_url_base = partition["api_url_base"]
+            if self.max_pr_age_days:
+                # Exclude long-stale PRs (e.g. bulk backlog cleanups) so they
+                # don't skew velocity stats or blow the 1000-result search cap.
+                floor = date.fromisoformat(f"{month}-01") - timedelta(days=self.max_pr_age_days)
+                query += f" created:>={floor.isoformat()}"
 
             month_count = self._search_aggregate_count(query, api_url_base)
             if month_count == 0:

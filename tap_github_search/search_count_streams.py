@@ -499,6 +499,7 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "mode": sd.get("mode"),
                 "markers": sd.get("markers", []),
                 "reviewer_clause": sd.get("reviewer_clause", ""),
+                "max_pr_age_days": sd.get("max_pr_age_days"),
             }
             errors = validate_stream_config(sc)
             if errors:
