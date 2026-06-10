@@ -45,13 +45,14 @@ class _GraphqlResponse:
         return self.payload
 
 
-def _mk_velocity(*, markers=None, reviewer="", instance="github_com"):
+def _mk_velocity(*, markers=None, reviewer="", instance="github_com", max_pr_age_days=None):
     stream_config = {
         "name": "pr_velocity",
         "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
         "mode": "pr_velocity",
         "markers": markers or [],
         "reviewer_clause": reviewer,
+        "max_pr_age_days": max_pr_age_days,
     }
     stream = ConfigurablePrVelocityStream(stream_config, _DummyTap())
     stream._search_cfg = {
@@ -242,6 +243,39 @@ def test_get_records_day_slices_when_month_exceeds_search_cap():
 
     assert fake_process.call_count == 30
     assert "closed:2026-04-01..2026-04-01" in fake_process.call_args_list[0][0][0]
+
+
+def test_get_records_appends_created_floor_when_max_pr_age_days_set():
+    stream = _mk_velocity(max_pr_age_days=365)
+    with patch.object(stream, "_search_aggregate_count", side_effect=[NODES_THRESHOLD + 1] + [5] * 30), \
+         patch.object(stream, "_process_window", return_value=[]) as fake_process:
+        list(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    # Floor anchored to the close month start; day slices carry the same floor.
+    assert fake_process.call_args_list[0][0][0] == (
+        "org:example-org type:pr is:closed closed:2026-04-01..2026-04-01 created:>=2025-04-01"
+    )
+
+
+def test_get_records_leaves_query_unchanged_without_max_pr_age_days():
+    stream = _mk_velocity()
+    with patch.object(stream, "_search_aggregate_count", return_value=5), \
+         patch.object(stream, "_process_window", return_value=[]) as fake_process:
+        list(stream.get_records({
+            "org": "example-org",
+            "month": "2026-04",
+            "search_query": "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30",
+            "api_url_base": DEFAULT_API_BASE_URL,
+        }))
+
+    assert fake_process.call_args_list[0][0][0] == (
+        "org:example-org type:pr is:closed closed:2026-04-01..2026-04-30"
+    )
 
 
 def test_get_records_fails_when_single_day_exceeds_search_cap():
