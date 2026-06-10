@@ -86,6 +86,24 @@ def test_dispatches_pr_velocity_mode():
     assert type(streams[0]) is ConfigurablePrVelocityStream
 
 
+def test_create_configurable_streams_passes_max_pr_age_days_through():
+    tap = _DummyTap()
+    config = {
+        "search": {
+            "streams": [{
+                "name": "pr_velocity",
+                "query_template": "org:{org} type:pr is:closed closed:{start}..{end}",
+                "mode": "pr_velocity",
+                "max_pr_age_days": 365,
+            }],
+            "scope": {"api_url_base": DEFAULT_API_BASE_URL, "orgs": ["example-org"]},
+            "backfill": {"start_month": "2026-04"},
+        }
+    }
+    streams = create_configurable_streams(tap, config_override=config)
+    assert streams[0].max_pr_age_days == 365
+
+
 def test_process_window_sets_minimal_fields_and_ai_flags():
     stream = _mk_velocity(
         markers=['"AI marker"', "assistant-marker"],
