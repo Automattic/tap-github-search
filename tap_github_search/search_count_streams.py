@@ -11,6 +11,7 @@ import requests
 from collections import Counter
 
 from singer_sdk import typing as th
+from singer_sdk.exceptions import RetriableAPIError
 from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
@@ -61,6 +62,23 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def _build_graphql_payload(self, query_template: str, variables: dict[str, Any]) -> dict[str, Any]:
         """Build a standardized GraphQL payload."""
         return {"query": query_template, "variables": variables}
+
+    def validate_response(self, response: requests.Response) -> None:
+        """Retry GitHub's transient server-side GraphQL failures.
+
+        github.com search occasionally returns 200 with an errors array like
+        "Something went wrong while executing your query ... Please include
+        `<request-id>` ...". Upstream tap_github treats any GraphQL error as
+        fatal; reclassify only this transient case as retriable so backoff
+        retries it. Everything else stays fatal.
+        """
+        if response.status_code == 200:
+            errors = (response.json().get("errors") or []) if response.content else []
+            if errors and all(
+                "Something went wrong while executing your query" in (e.get("message") or "") for e in errors
+            ):
+                raise RetriableAPIError(f"GitHub transient GraphQL error: {errors[0]['message']}", response)
+        super().validate_response(response)
 
     def _make_graphql_request(self, query_template: str, variables: dict[str, Any], api_url_base: str):
         """Make a GraphQL request with standardized payload building."""
