@@ -7,6 +7,7 @@ import logging
 from unittest.mock import Mock, patch
 import pytest
 import requests
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 
 from tap_github_search.search_count_streams import (
     ConfigurableSearchCountStream,
@@ -416,3 +417,39 @@ def test_null_nodes_skipped_in_repo_counts(monkeypatch):
 
     result = s._get_repo_counts_from_nodes("org:Test type:pr", "https://api.github.com")
     assert result == {"foo": 2, "bar": 1}
+
+
+class _FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.content = b"x"
+        self.headers = {}
+        self.url = "https://api.github.com/graphql"
+        self.reason = "OK"
+
+    def json(self):
+        return self.payload
+
+
+def test_validate_response_retries_transient_graphql_error():
+    stream = _mk_stream()
+    resp = _FakeResponse({"errors": [{"message": (
+        "Something went wrong while executing your query on 2026-06-11T02:59:54Z. "
+        "Please include `E2D4:EBE9B` when reporting this issue."
+    )}]})
+    with pytest.raises(RetriableAPIError, match="transient"):
+        stream.validate_response(resp)
+
+
+def test_validate_response_keeps_real_graphql_errors_fatal():
+    stream = _mk_stream()
+    resp = _FakeResponse({"errors": [{"type": "FORBIDDEN", "message": "org forbids access"}]})
+    with pytest.raises(FatalAPIError, match="Graphql error"):
+        stream.validate_response(resp)
+
+
+def test_validate_response_passes_clean_response():
+    stream = _mk_stream()
+    resp = _FakeResponse({"data": {"search": {"issueCount": 1}}})
+    stream.validate_response(resp)
