@@ -115,7 +115,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     GRAPHQL_SEARCH_WITH_REPOS: ClassVar[str] = (
         """
         query SearchWithRepos($q: String!, $after: String) {
-          search(query: $q, type: ISSUE, first: 100, after: $after) {
+          search(query: $q, type: ISSUE_ADVANCED, first: 100, after: $after) {
             issueCount
             pageInfo { hasNextPage endCursor }
             nodes {
@@ -132,7 +132,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     GRAPHQL_SEARCH_COUNT_ONLY: ClassVar[str] = (
         """
         query SearchCount($q: String!) {
-          search(query: $q, type: ISSUE, first: 1) {
+          search(query: $q, type: ISSUE_ADVANCED, first: 1) {
             issueCount
           }
           rateLimit { cost remaining }
@@ -294,7 +294,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             var_name = f"q{i}"
             alias = f"a{i}"
             var_defs.append(f"${var_name}: String!")
-            fields.append(f"{alias}: search(query: ${var_name}, type: ISSUE, first: 1) {{ issueCount }}")
+            fields.append(f"{alias}: search(query: ${var_name}, type: ISSUE_ADVANCED, first: 1) {{ issueCount }}")
             variables[var_name] = query
             
         var_section = ", ".join(var_defs)
