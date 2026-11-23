@@ -108,74 +108,40 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             th.Property("updated_at", th.DateTimeType),
         ).to_dict()
 
-    @classmethod
-    def get_schema(cls) -> dict:
-        return cls._build_search_schema()
-
-    # Deprecated in the GitHub schema (scheduled for removal); detected at runtime.
-    _SEARCH_TYPE_PROBE: ClassVar[str] = (
-        """
-        query SearchTypeProbe {
-          __type(name: "SearchType") { enumValues(includeDeprecated: true) { name } }
-        }
-        """
-    )
-
-    def _detect_search_type(self, api_url_base: str) -> str:
-        """Pick the search type the host supports.
-
-        Advanced issue search requires the ISSUE_ADVANCED search type on hosts that
-        still offer it. GitHub has deprecated ISSUE_ADVANCED and scheduled its
-        removal (after which plain ISSUE handles advanced syntax), so probe the
-        SearchType enum once per host and fall back to ISSUE when the advanced
-        type is gone. Mirrors gh's feature detection.
-        """
-        if getattr(self, "_search_type_cache", None) is None:
-            self._search_type_cache = {}
-        cached = self._search_type_cache.get(api_url_base)
-        if cached:
-            return cached
-        response = self._make_graphql_request(self._SEARCH_TYPE_PROBE, {}, api_url_base)
-        payload = response.json() or {}
-        data = payload.get("data")
-        type_node = (data or {}).get("__type")
-        if data is None or type_node is None:
-            raise RuntimeError(f"Search type probe for {api_url_base} returned no usable data")
-        enum_values = type_node.get("enumValues") or []
-        names = {v.get("name") for v in enum_values}
-        detected = "ISSUE_ADVANCED" if "ISSUE_ADVANCED" in names else "ISSUE"
-        self._search_type_cache[api_url_base] = detected
-        if detected == "ISSUE":
-            self.logger.warning(
-                "Host %s does not offer ISSUE_ADVANCED; streams configured with "
-                "search_type=ISSUE_ADVANCED will fail (plain ISSUE cannot count "
-                "advanced syntax on this host)",
-                api_url_base,
-            )
-        else:
-            self.logger.info(f"Search type for {api_url_base}: {detected}")
-        return detected
+    _SEARCH_TYPE_PROBE: ClassVar[str] = """
+    query SearchTypeProbe {
+      __type(name: "SearchType") { enumValues(includeDeprecated: true) { name } }
+    }
+    """
 
     def _resolve_search_type(self, api_url_base: str) -> str:
-        """Pick the search type for this stream.
+        """Return the configured search type, probing the host once for ISSUE_ADVANCED.
 
-        Streams default to plain ISSUE and never probe the host. Only streams
-        configured with search_type=ISSUE_ADVANCED probe the SearchType enum,
-        configured with search_type=ISSUE_ADVANCED probe the SearchType enum.
-        If the host does not offer ISSUE_ADVANCED, raise: plain ISSUE silently
-        drops advanced qualifiers (e.g. type:Bug) and returns wrong zeros.
+        Plain ISSUE needs no probe. Streams configured with ISSUE_ADVANCED probe the
+        host's SearchType enum (cached per host) and fail fast if the host does not
+        offer it, rather than silently dropping advanced qualifiers.
         """
         configured = getattr(self, "search_type_config", None) or "ISSUE"
         if configured != "ISSUE_ADVANCED":
-            return "ISSUE"
-        detected = self._detect_search_type(api_url_base)
-        if detected != "ISSUE_ADVANCED":
+            return configured
+        cache = self.__dict__.setdefault("_search_type_cache", {})
+        if api_url_base not in cache:
+            resp = self._make_graphql_request(self._SEARCH_TYPE_PROBE, {}, api_url_base)
+            names = {
+                v.get("name")
+                for v in ((resp.json().get("data") or {}).get("__type") or {}).get("enumValues") or []
+            }
+            cache[api_url_base] = "ISSUE_ADVANCED" if "ISSUE_ADVANCED" in names else None
+        if cache[api_url_base] != "ISSUE_ADVANCED":
             raise RuntimeError(
                 f"Stream {getattr(self, 'name', 'unknown')!r} configured ISSUE_ADVANCED "
-                f"but {api_url_base} does not offer it; plain ISSUE would drop advanced "
-                f"qualifiers and return wrong counts"
+                f"but {api_url_base} does not offer it"
             )
-        return detected
+        return "ISSUE_ADVANCED"
+
+    @classmethod
+    def get_schema(cls) -> dict:
+        return cls._build_search_schema()
 
     def _graphql_search_with_repos(self, api_url_base: str) -> str:
         search_type = self._resolve_search_type(api_url_base)

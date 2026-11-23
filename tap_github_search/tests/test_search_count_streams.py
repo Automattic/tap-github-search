@@ -455,119 +455,6 @@ def test_validate_response_passes_clean_response():
     stream.validate_response(resp)
 
 
-def test_search_type_detection_is_per_host(monkeypatch):
-    s = _mk_stream()
-
-    def fake_request(query, variables, api_url_base):
-        resp = Mock()
-        names = [{"name": "ISSUE"}] if "ghe" in api_url_base else [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]
-        resp.json.return_value = {"data": {"__type": {"enumValues": names}}}
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-
-    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
-    assert s._detect_search_type("https://ghe.example.com/api/v3") == "ISSUE"
-
-
-def test_resolve_search_type_defaults_to_issue_without_probing(monkeypatch):
-    s = _mk_stream()
-    s.search_type_config = "ISSUE"
-
-    def fake_request(query, variables, api_url_base):
-        raise AssertionError("must not probe for ISSUE-configured streams")
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    assert s._resolve_search_type("https://api.github.com") == "ISSUE"
-    assert "type: ISSUE," in s._graphql_search_count_only("https://api.github.com")
-
-
-def test_resolve_search_type_advanced_probes_and_caches(monkeypatch):
-    s = _mk_stream()
-    s.search_type_config = "ISSUE_ADVANCED"
-    calls = []
-
-    def fake_request(query, variables, api_url_base):
-        calls.append(query)
-        resp = Mock()
-        resp.json.return_value = {
-            "data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}
-        }
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
-    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
-    assert len(calls) == 1
-    assert "type: ISSUE_ADVANCED," in s._graphql_search_count_only("https://api.github.com")
-
-
-def test_resolve_search_type_raises_when_host_lacks_issue_advanced(monkeypatch, caplog):
-    s = _mk_stream()
-    s.search_type_config = "ISSUE_ADVANCED"
-
-    def fake_request(query, variables, api_url_base):
-        resp = Mock()
-        resp.json.return_value = {
-            "data": {"__type": {"enumValues": [{"name": "ISSUE"}]}}
-        }
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(RuntimeError, match="does not offer"):
-            s._resolve_search_type("https://api.github.com")
-    assert any("ISSUE_ADVANCED" in r.message for r in caplog.records)
-
-
-def test_detect_search_type_raises_on_null_data_and_does_not_cache(monkeypatch):
-    s = _mk_stream()
-    calls = []
-
-    def fake_request(query, variables, api_url_base):
-        calls.append(query)
-        resp = Mock()
-        resp.json.return_value = {"data": None}
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    with pytest.raises(RuntimeError, match="no usable data"):
-        s._detect_search_type("https://api.github.com")
-    assert "https://api.github.com" not in s._search_type_cache
-    with pytest.raises(RuntimeError, match="no usable data"):
-        s._detect_search_type("https://api.github.com")
-    assert len(calls) == 2
-
-
-def test_detect_search_type_raises_on_null_type_node(monkeypatch):
-    s = _mk_stream()
-
-    def fake_request(query, variables, api_url_base):
-        resp = Mock()
-        resp.json.return_value = {"data": {"__type": None}}
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    with pytest.raises(RuntimeError, match="no usable data"):
-        s._detect_search_type("https://api.github.com")
-
-
-def test_detect_search_type_logs_fallback_warning_once_per_host(monkeypatch, caplog):
-    s = _mk_stream()
-
-    def fake_request(query, variables, api_url_base):
-        resp = Mock()
-        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}]}}}
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    with caplog.at_level(logging.WARNING):
-        assert s._detect_search_type("https://api.github.com") == "ISSUE"
-        assert s._detect_search_type("https://api.github.com") == "ISSUE"
-    warnings = [r for r in caplog.records if "ISSUE_ADVANCED" in r.message]
-    assert len(warnings) == 1
-
-
 def test_validate_stream_config_accepts_advanced():
     good = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ISSUE_ADVANCED"}
     assert validate_stream_config(good) == []
@@ -669,3 +556,45 @@ def test_batch_fallback_catches_fatal_api_error(monkeypatch):
     monkeypatch.setattr(s, "_search_aggregate_count", fake_count)
     counts = s._get_repo_counts_via_batching(["a", "b"], "Automattic", "type:issue", "https://api.github.com")
     assert counts == {"a": 5, "b": 5}
+
+
+def test_resolve_search_type_raises_when_host_lacks_issue_advanced(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    with pytest.raises(RuntimeError, match="does not offer"):
+        s._resolve_search_type("https://api.github.com")
+
+
+def test_resolve_search_type_does_not_probe_for_issue_streams(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE"
+
+    def fake_request(query, variables, api_url_base):
+        raise AssertionError("must not probe for ISSUE-configured streams")
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE"
+
+
+def test_resolve_search_type_caches_probe_per_host(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+    calls = []
+
+    def fake_request(query, variables, api_url_base):
+        calls.append(query)
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert len(calls) == 1
