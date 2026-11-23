@@ -453,3 +453,53 @@ def test_validate_response_passes_clean_response():
     stream = _mk_stream()
     resp = _FakeResponse({"data": {"search": {"issueCount": 1}}})
     stream.validate_response(resp)
+
+
+def test_detect_search_type_prefers_advanced_when_present(monkeypatch):
+    s = _mk_stream()
+    calls = []
+
+    def fake_request(query, variables, api_url_base):
+        calls.append(query)
+        resp = Mock()
+        resp.json.return_value = {
+            "data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}
+        }
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+
+    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert len(calls) == 1
+
+
+def test_detect_search_type_falls_back_to_issue_when_advanced_gone(monkeypatch):
+    s = _mk_stream()
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {
+            "data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "REPOSITORY"}]}}
+        }
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+
+    assert s._detect_search_type("https://api.github.com") == "ISSUE"
+    assert "type: ISSUE," in s._graphql_search_count_only("https://api.github.com")
+
+
+def test_search_type_detection_is_per_host(monkeypatch):
+    s = _mk_stream()
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        names = [{"name": "ISSUE"}] if "ghe" in api_url_base else [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]
+        resp.json.return_value = {"data": {"__type": {"enumValues": names}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+
+    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert s._detect_search_type("https://ghe.example.com/api/v3") == "ISSUE"

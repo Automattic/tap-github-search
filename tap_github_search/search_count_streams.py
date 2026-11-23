@@ -112,37 +112,63 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     def get_schema(cls) -> dict:
         return cls._build_search_schema()
 
-    GRAPHQL_SEARCH_WITH_REPOS: ClassVar[str] = (
+    # Deprecated in the GitHub schema (scheduled for removal); detected at runtime.
+    _SEARCH_TYPE_PROBE: ClassVar[str] = (
         """
-        query SearchWithRepos($q: String!, $after: String) {
-          search(query: $q, type: ISSUE_ADVANCED, first: 100, after: $after) {
-            issueCount
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              ... on Issue { repository { name } }
-              ... on PullRequest { repository { name } }
-            }
-          }
-          rateLimit { cost remaining }
+        query SearchTypeProbe {
+          __type(name: "SearchType") { enumValues { name } }
         }
         """
     )
 
-    # Essential GraphQL fix for comma-separated labels
-    GRAPHQL_SEARCH_COUNT_ONLY: ClassVar[str] = (
-        """
-        query SearchCount($q: String!) {
-          search(query: $q, type: ISSUE_ADVANCED, first: 1) {
-            issueCount
-          }
-          rateLimit { cost remaining }
-        }
-        """
-    )
+    def _detect_search_type(self, api_url_base: str) -> str:
+        """Pick the search type the host supports.
 
-    @property
-    def query(self) -> str:
-        return self.GRAPHQL_SEARCH_WITH_REPOS
+        Advanced issue search requires the ISSUE_ADVANCED search type on hosts that
+        still offer it. GitHub has deprecated ISSUE_ADVANCED and scheduled its
+        removal (after which plain ISSUE handles advanced syntax), so probe the
+        SearchType enum once per host and fall back to ISSUE when the advanced
+        type is gone. Mirrors gh's feature detection.
+        """
+        if getattr(self, "_search_type_cache", None) is None:
+            self._search_type_cache = {}
+        cached = self._search_type_cache.get(api_url_base)
+        if cached:
+            return cached
+        response = self._make_graphql_request(self._SEARCH_TYPE_PROBE, {}, api_url_base)
+        enum_values = (((response.json().get("data") or {}).get("__type") or {}).get("enumValues") or [])
+        names = {v.get("name") for v in enum_values}
+        detected = "ISSUE_ADVANCED" if "ISSUE_ADVANCED" in names else "ISSUE"
+        self._search_type_cache[api_url_base] = detected
+        self.logger.info(f"Search type for {api_url_base}: {detected}")
+        return detected
+
+    def _graphql_search_with_repos(self, api_url_base: str) -> str:
+        search_type = self._detect_search_type(api_url_base)
+        return f"""
+        query SearchWithRepos($q: String!, $after: String) {{
+          search(query: $q, type: {search_type}, first: 100, after: $after) {{
+            issueCount
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{
+              ... on Issue {{ repository {{ name }} }}
+              ... on PullRequest {{ repository {{ name }} }}
+            }}
+          }}
+          rateLimit {{ cost remaining }}
+        }}
+        """
+
+    def _graphql_search_count_only(self, api_url_base: str) -> str:
+        search_type = self._detect_search_type(api_url_base)
+        return f"""
+        query SearchCount($q: String!) {{
+          search(query: $q, type: {search_type}, first: 1) {{
+            issueCount
+          }}
+          rateLimit {{ cost remaining }}
+        }}
+        """
 
     @property
     def authenticator(self) -> WrapperGitHubTokenAuthenticator:
@@ -289,12 +315,13 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         var_defs = []
         fields = []
         variables: dict[str, str] = {}
-        
+        search_type = self._detect_search_type(api_url_base)
+
         for i, query in enumerate(queries):
             var_name = f"q{i}"
             alias = f"a{i}"
             var_defs.append(f"${var_name}: String!")
-            fields.append(f"{alias}: search(query: ${var_name}, type: ISSUE_ADVANCED, first: 1) {{ issueCount }}")
+            fields.append(f"{alias}: search(query: ${var_name}, type: {search_type}, first: 1) {{ issueCount }}")
             variables[var_name] = query
             
         var_section = ", ".join(var_defs)
@@ -320,7 +347,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
     def _search_aggregate_count(self, query: str, api_url_base: str) -> int:
         """Essential GraphQL variables fix for comma-separated labels."""
-        response = self._make_graphql_request(self.GRAPHQL_SEARCH_COUNT_ONLY, {"q": query}, api_url_base)
+        response = self._make_graphql_request(self._graphql_search_count_only(api_url_base), {"q": query}, api_url_base)
         response_json = response.json()
         return response_json["data"]["search"]["issueCount"]
 
@@ -329,7 +356,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         after = None
         skipped = 0
         while True:
-            response = self._make_graphql_request(self.query, {"q": query, "after": after}, api_url_base)
+            response = self._make_graphql_request(self._graphql_search_with_repos(api_url_base), {"q": query, "after": after}, api_url_base)
             response_json = response.json()
             search = response_json["data"]["search"]
             for node in search["nodes"]:
