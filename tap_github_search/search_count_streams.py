@@ -11,7 +11,7 @@ import requests
 from collections import Counter
 
 from singer_sdk import typing as th
-from singer_sdk.exceptions import RetriableAPIError
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
@@ -116,7 +116,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
     _SEARCH_TYPE_PROBE: ClassVar[str] = (
         """
         query SearchTypeProbe {
-          __type(name: "SearchType") { enumValues { name } }
+          __type(name: "SearchType") { enumValues(includeDeprecated: true) { name } }
         }
         """
     )
@@ -143,8 +143,30 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         self.logger.info(f"Search type for {api_url_base}: {detected}")
         return detected
 
+    def _resolve_search_type(self, api_url_base: str) -> str:
+        """Pick the search type for this stream.
+
+        Streams default to plain ISSUE and never probe the host. Only streams
+        configured with search_type=ISSUE_ADVANCED probe the SearchType enum,
+        and only on hosts that still offer the (deprecated) advanced type.
+        When the host has removed ISSUE_ADVANCED, fall back to ISSUE with a
+        warning: GitHub handles advanced search syntax through plain ISSUE after
+        removal.
+        """
+        configured = getattr(self, "search_type_config", None) or "ISSUE"
+        if configured != "ISSUE_ADVANCED":
+            return "ISSUE"
+        detected = self._detect_search_type(api_url_base)
+        if detected == "ISSUE":
+            self.logger.warning(
+                "Stream %s configured ISSUE_ADVANCED but %s no longer offers it; "
+                "falling back to ISSUE (advanced syntax is handled by plain ISSUE on this host)",
+                getattr(self, "name", "unknown"), api_url_base,
+            )
+        return detected
+
     def _graphql_search_with_repos(self, api_url_base: str) -> str:
-        search_type = self._detect_search_type(api_url_base)
+        search_type = self._resolve_search_type(api_url_base)
         return f"""
         query SearchWithRepos($q: String!, $after: String) {{
           search(query: $q, type: {search_type}, first: 100, after: $after) {{
@@ -160,7 +182,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         """
 
     def _graphql_search_count_only(self, api_url_base: str) -> str:
-        search_type = self._detect_search_type(api_url_base)
+        search_type = self._resolve_search_type(api_url_base)
         return f"""
         query SearchCount($q: String!) {{
           search(query: $q, type: {search_type}, first: 1) {{
@@ -295,7 +317,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:  # Only include repos with results
                         repo_counts[repo_name] = count
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, RetriableAPIError, FatalAPIError) as e:
                 self.logger.warning(f"Batch failed, falling back to individual queries: {str(e)}")
                 # Fallback to individual queries
                 for repo in batch_repos:
@@ -315,7 +337,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         var_defs = []
         fields = []
         variables: dict[str, str] = {}
-        search_type = self._detect_search_type(api_url_base)
+        search_type = self._resolve_search_type(api_url_base)
 
         for i, query in enumerate(queries):
             var_name = f"q{i}"
@@ -439,6 +461,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         self.stream_description = stream_config.get("description", f"Search stream: {stream_config['name']}")
         self.name = f"{stream_config['name']}_search_counts"
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "custom"))
+        self.search_type_config = stream_config.get("search_type", "ISSUE")
         self.tap = tap
         super().__init__(tap=tap, name=self.name, schema=self.get_schema())
 
@@ -523,6 +546,9 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     name = stream_config.get("name", "")
     if name and not name.replace("_", "").replace("-", "").isalnum():
         errors.append(f"Stream name '{name}' must contain only alphanumeric characters, underscores, and hyphens")
+    search_type = stream_config.get("search_type")
+    if search_type is not None and search_type not in ("ISSUE", "ISSUE_ADVANCED"):
+        errors.append(f"search_type must be one of: ISSUE, ISSUE_ADVANCED (got '{search_type}')")
     query_template = stream_config.get("query_template", "")
     for placeholder in ["{org}", "{start}", "{end}"]:
         if placeholder not in query_template:
@@ -545,6 +571,7 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "markers": sd.get("markers", []),
                 "reviewer_clause": sd.get("reviewer_clause", ""),
                 "max_pr_age_days": sd.get("max_pr_age_days"),
+                "search_type": sd.get("search_type", "ISSUE"),
             }
             errors = validate_stream_config(sc)
             if errors:
