@@ -453,3 +453,148 @@ def test_validate_response_passes_clean_response():
     stream = _mk_stream()
     resp = _FakeResponse({"data": {"search": {"issueCount": 1}}})
     stream.validate_response(resp)
+
+
+def test_validate_stream_config_accepts_advanced():
+    good = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ISSUE_ADVANCED"}
+    assert validate_stream_config(good) == []
+
+
+def test_validate_stream_config_rejects_bad_search_type():
+    bad = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ADVANCED"}
+    with pytest.raises(ValueError, match="Invalid search_type"):
+        validate_stream_config(bad)
+
+
+def test_validate_stream_config_rejects_pr_velocity_search_type():
+    bad = {"name": "velocity", "mode": "pr_velocity", "query_template": "org:{org} type:pr created:{start}..{end}", "search_type": "ISSUE"}
+    with pytest.raises(ValueError, match="not supported for mode=pr_velocity"):
+        validate_stream_config(bad)
+
+
+def test_batch_path_uses_configured_search_type(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+    queries = []
+
+    def fake_request(query, variables, api_url_base):
+        queries.append(query)
+        resp = Mock()
+        if "__type" in query:
+            resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}}
+        else:
+            resp.json.return_value = {"data": {"a0": {"issueCount": 3}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    counts = s._search_aggregate_count_batch(["repo:o/a q"], "https://api.github.com")
+    assert counts == [3]
+    assert any("type: ISSUE_ADVANCED" in q for q in queries)
+
+
+def test_batch_fallback_catches_singer_sdk_errors(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE"
+
+    def raise_retriable(queries, api_url_base):
+        raise RetriableAPIError("boom")
+
+    def fake_count(query, api_url_base):
+        return 5
+
+    monkeypatch.setattr(s, "_search_aggregate_count_batch", raise_retriable)
+    monkeypatch.setattr(s, "_search_aggregate_count", fake_count)
+    counts = s._get_repo_counts_via_batching(["a", "b"], "Automattic", "type:issue", "https://api.github.com")
+    assert counts == {"a": 5, "b": 5}
+
+
+def test_create_configurable_streams_passes_search_type_through():
+    cfg = {
+        "search": {
+            "streams": [
+                {
+                    "name": "bugs",
+                    "query_template": "org:{org} type:issue created:{start}..{end}",
+                    "search_type": "ISSUE_ADVANCED",
+                }
+            ],
+            "scope": {"api_url_base": "https://api.github.com", "orgs": ["Automattic"], "breakdown": "none"},
+            "backfill": {"start_month": "2025-01", "end_month": "2025-01"},
+        }
+    }
+    tap = TapGitHubSearch(config=cfg)
+    streams = create_configurable_streams(tap, cfg)
+    assert len(streams) == 1
+    assert streams[0].search_type_config == "ISSUE_ADVANCED"
+
+
+def test_nodes_path_sends_configured_search_type(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    query = s._graphql_search_with_repos("https://api.github.com")
+    assert "type: ISSUE_ADVANCED" in query
+
+
+def test_batch_fallback_catches_fatal_api_error(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE"
+
+    def raise_fatal(queries, api_url_base):
+        raise FatalAPIError("boom")
+
+    def fake_count(query, api_url_base):
+        return 5
+
+    monkeypatch.setattr(s, "_search_aggregate_count_batch", raise_fatal)
+    monkeypatch.setattr(s, "_search_aggregate_count", fake_count)
+    counts = s._get_repo_counts_via_batching(["a", "b"], "Automattic", "type:issue", "https://api.github.com")
+    assert counts == {"a": 5, "b": 5}
+
+
+def test_resolve_search_type_raises_when_host_lacks_issue_advanced(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    with pytest.raises(RuntimeError, match="does not offer"):
+        s._resolve_search_type("https://api.github.com")
+
+
+def test_resolve_search_type_does_not_probe_for_issue_streams(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE"
+
+    def fake_request(query, variables, api_url_base):
+        raise AssertionError("must not probe for ISSUE-configured streams")
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE"
+
+
+def test_resolve_search_type_caches_probe_per_host(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+    calls = []
+
+    def fake_request(query, variables, api_url_base):
+        calls.append(query)
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert s._resolve_search_type("https://api.github.com") == "ISSUE_ADVANCED"
+    assert len(calls) == 1

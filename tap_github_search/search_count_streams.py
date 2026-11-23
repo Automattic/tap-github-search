@@ -11,7 +11,7 @@ import requests
 from collections import Counter
 
 from singer_sdk import typing as th
-from singer_sdk.exceptions import RetriableAPIError
+from singer_sdk.exceptions import FatalAPIError, RetriableAPIError
 from singer_sdk.helpers.types import Context
 
 from tap_github.client import GitHubGraphqlStream
@@ -108,41 +108,67 @@ class SearchCountStreamBase(GitHubGraphqlStream):
             th.Property("updated_at", th.DateTimeType),
         ).to_dict()
 
+    _SEARCH_TYPE_PROBE: ClassVar[str] = """
+    query SearchTypeProbe {
+      __type(name: "SearchType") { enumValues(includeDeprecated: true) { name } }
+    }
+    """
+
+    def _resolve_search_type(self, api_url_base: str) -> str:
+        """Return the configured search type, probing the host once for ISSUE_ADVANCED.
+
+        Plain ISSUE needs no probe. Streams configured with ISSUE_ADVANCED probe the
+        host's SearchType enum (cached per host) and fail fast if the host does not
+        offer it, rather than silently dropping advanced qualifiers.
+        """
+        configured = getattr(self, "search_type_config", None) or "ISSUE"
+        if configured != "ISSUE_ADVANCED":
+            return configured
+        cache = self.__dict__.setdefault("_search_type_cache", {})
+        if api_url_base not in cache:
+            resp = self._make_graphql_request(self._SEARCH_TYPE_PROBE, {}, api_url_base)
+            names = {
+                v.get("name")
+                for v in ((resp.json().get("data") or {}).get("__type") or {}).get("enumValues") or []
+            }
+            cache[api_url_base] = "ISSUE_ADVANCED" if "ISSUE_ADVANCED" in names else None
+        if cache[api_url_base] != "ISSUE_ADVANCED":
+            raise RuntimeError(
+                f"Stream {getattr(self, 'name', 'unknown')!r} configured ISSUE_ADVANCED "
+                f"but {api_url_base} does not offer it"
+            )
+        return "ISSUE_ADVANCED"
+
     @classmethod
     def get_schema(cls) -> dict:
         return cls._build_search_schema()
 
-    GRAPHQL_SEARCH_WITH_REPOS: ClassVar[str] = (
-        """
-        query SearchWithRepos($q: String!, $after: String) {
-          search(query: $q, type: ISSUE, first: 100, after: $after) {
+    def _graphql_search_with_repos(self, api_url_base: str) -> str:
+        search_type = self._resolve_search_type(api_url_base)
+        return f"""
+        query SearchWithRepos($q: String!, $after: String) {{
+          search(query: $q, type: {search_type}, first: 100, after: $after) {{
             issueCount
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              ... on Issue { repository { name } }
-              ... on PullRequest { repository { name } }
-            }
-          }
-          rateLimit { cost remaining }
-        }
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{
+              ... on Issue {{ repository {{ name }} }}
+              ... on PullRequest {{ repository {{ name }} }}
+            }}
+          }}
+          rateLimit {{ cost remaining }}
+        }}
         """
-    )
 
-    # Essential GraphQL fix for comma-separated labels
-    GRAPHQL_SEARCH_COUNT_ONLY: ClassVar[str] = (
-        """
-        query SearchCount($q: String!) {
-          search(query: $q, type: ISSUE, first: 1) {
+    def _graphql_search_count_only(self, api_url_base: str) -> str:
+        search_type = self._resolve_search_type(api_url_base)
+        return f"""
+        query SearchCount($q: String!) {{
+          search(query: $q, type: {search_type}, first: 1) {{
             issueCount
-          }
-          rateLimit { cost remaining }
-        }
+          }}
+          rateLimit {{ cost remaining }}
+        }}
         """
-    )
-
-    @property
-    def query(self) -> str:
-        return self.GRAPHQL_SEARCH_WITH_REPOS
 
     @property
     def authenticator(self) -> WrapperGitHubTokenAuthenticator:
@@ -269,7 +295,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
                 for repo_name, count in zip(batch_repos, counts):
                     if count > 0:  # Only include repos with results
                         repo_counts[repo_name] = count
-            except requests.exceptions.RequestException as e:
+            except (requests.exceptions.RequestException, RetriableAPIError, FatalAPIError) as e:
                 self.logger.warning(f"Batch failed, falling back to individual queries: {str(e)}")
                 # Fallback to individual queries
                 for repo in batch_repos:
@@ -289,12 +315,13 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         var_defs = []
         fields = []
         variables: dict[str, str] = {}
-        
+        search_type = self._resolve_search_type(api_url_base)
+
         for i, query in enumerate(queries):
             var_name = f"q{i}"
             alias = f"a{i}"
             var_defs.append(f"${var_name}: String!")
-            fields.append(f"{alias}: search(query: ${var_name}, type: ISSUE, first: 1) {{ issueCount }}")
+            fields.append(f"{alias}: search(query: ${var_name}, type: {search_type}, first: 1) {{ issueCount }}")
             variables[var_name] = query
             
         var_section = ", ".join(var_defs)
@@ -320,7 +347,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
     def _search_aggregate_count(self, query: str, api_url_base: str) -> int:
         """Essential GraphQL variables fix for comma-separated labels."""
-        response = self._make_graphql_request(self.GRAPHQL_SEARCH_COUNT_ONLY, {"q": query}, api_url_base)
+        response = self._make_graphql_request(self._graphql_search_count_only(api_url_base), {"q": query}, api_url_base)
         response_json = response.json()
         return response_json["data"]["search"]["issueCount"]
 
@@ -329,7 +356,7 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         after = None
         skipped = 0
         while True:
-            response = self._make_graphql_request(self.query, {"q": query, "after": after}, api_url_base)
+            response = self._make_graphql_request(self._graphql_search_with_repos(api_url_base), {"q": query, "after": after}, api_url_base)
             response_json = response.json()
             search = response_json["data"]["search"]
             for node in search["nodes"]:
@@ -412,6 +439,7 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
         self.stream_description = stream_config.get("description", f"Search stream: {stream_config['name']}")
         self.name = f"{stream_config['name']}_search_counts"
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "custom"))
+        self.search_type_config = stream_config.get("search_type", "ISSUE")
         self.tap = tap
         super().__init__(tap=tap, name=self.name, schema=self.get_schema())
 
@@ -488,6 +516,13 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
 
 
 def validate_stream_config(stream_config: dict) -> list[str]:
+    """Validate a stream config. Raises ValueError for unsupported search_type."""
+    search_type = stream_config.get("search_type")
+    if stream_config.get("mode") == "pr_velocity" and search_type is not None:
+        raise ValueError(f"search_type is not supported for mode=pr_velocity streams (got '{search_type}')")
+    if search_type is not None and search_type not in ("ISSUE", "ISSUE_ADVANCED"):
+        raise ValueError(f"Invalid search_type '{search_type}' for stream '{stream_config.get('name', 'unknown')}': must be ISSUE or ISSUE_ADVANCED")
+
     errors = []
     required_fields = ["name", "query_template"]
     for field in required_fields:
@@ -510,6 +545,8 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
     if "search" in config:
         s = config.get("search", {})
         for sd in s.get("streams", []):
+            raw_search_type = sd.get("search_type")
+            normalized_search_type = str(raw_search_type).strip().upper() if raw_search_type is not None else None
             sc = {
                 "name": sd.get("name"),
                 "query_template": sd.get("query_template"),
@@ -518,11 +555,13 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "markers": sd.get("markers", []),
                 "reviewer_clause": sd.get("reviewer_clause", ""),
                 "max_pr_age_days": sd.get("max_pr_age_days"),
+                "search_type": normalized_search_type,
             }
             errors = validate_stream_config(sc)
             if errors:
                 tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
+            sc["search_type"] = normalized_search_type or "ISSUE"
             if sd.get("mode") == "pr_velocity":
                 from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
 
