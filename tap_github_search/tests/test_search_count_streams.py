@@ -455,41 +455,6 @@ def test_validate_response_passes_clean_response():
     stream.validate_response(resp)
 
 
-def test_detect_search_type_prefers_advanced_when_present(monkeypatch):
-    s = _mk_stream()
-    calls = []
-
-    def fake_request(query, variables, api_url_base):
-        calls.append(query)
-        resp = Mock()
-        resp.json.return_value = {
-            "data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}
-        }
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-
-    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
-    assert s._detect_search_type("https://api.github.com") == "ISSUE_ADVANCED"
-    assert len(calls) == 1
-
-
-def test_detect_search_type_falls_back_to_issue_when_advanced_gone(monkeypatch):
-    s = _mk_stream()
-
-    def fake_request(query, variables, api_url_base):
-        resp = Mock()
-        resp.json.return_value = {
-            "data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "REPOSITORY"}]}}
-        }
-        return resp
-
-    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-
-    assert s._detect_search_type("https://api.github.com") == "ISSUE"
-    assert "type: ISSUE," in s._graphql_search_count_only("https://api.github.com")
-
-
 def test_search_type_detection_is_per_host(monkeypatch):
     s = _mk_stream()
 
@@ -556,6 +521,7 @@ def test_resolve_search_type_falls_back_to_issue_with_warning(monkeypatch, caplo
     with caplog.at_level(logging.WARNING):
         assert s._resolve_search_type("https://api.github.com") == "ISSUE"
     assert any("ISSUE_ADVANCED" in r.message for r in caplog.records)
+    assert "type: ISSUE," in s._graphql_search_count_only("https://api.github.com")
 
 
 def test_detect_search_type_handles_null_type(monkeypatch):
