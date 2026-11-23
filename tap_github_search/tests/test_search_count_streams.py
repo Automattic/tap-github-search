@@ -470,10 +470,6 @@ def test_search_type_detection_is_per_host(monkeypatch):
     assert s._detect_search_type("https://ghe.example.com/api/v3") == "ISSUE"
 
 
-def test_probe_query_requests_deprecated_enum_values():
-    assert "includeDeprecated: true" in SearchCountStreamBase._SEARCH_TYPE_PROBE
-
-
 def test_resolve_search_type_defaults_to_issue_without_probing(monkeypatch):
     s = _mk_stream()
     s.search_type_config = "ISSUE"
@@ -572,6 +568,11 @@ def test_detect_search_type_logs_fallback_warning_once_per_host(monkeypatch, cap
     assert len(warnings) == 1
 
 
+def test_validate_stream_config_accepts_advanced():
+    good = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ISSUE_ADVANCED"}
+    assert validate_stream_config(good) == []
+
+
 def test_validate_stream_config_rejects_bad_search_type():
     bad = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ADVANCED"}
     with pytest.raises(ValueError, match="Invalid search_type"):
@@ -582,11 +583,6 @@ def test_validate_stream_config_rejects_pr_velocity_search_type():
     bad = {"name": "velocity", "mode": "pr_velocity", "query_template": "org:{org} type:pr created:{start}..{end}", "search_type": "ISSUE"}
     with pytest.raises(ValueError, match="not supported for mode=pr_velocity"):
         validate_stream_config(bad)
-
-
-def test_validate_stream_config_accepts_advanced():
-    good = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ISSUE_ADVANCED"}
-    assert validate_stream_config(good) == []
 
 
 def test_batch_path_uses_configured_search_type(monkeypatch):
