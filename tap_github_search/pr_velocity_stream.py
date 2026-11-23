@@ -78,7 +78,6 @@ class ConfigurablePrVelocityStream(ConfigurableSearchCountStream):
         self.name = stream_config["name"]
         self.stream_type = stream_config.get("stream_type", stream_config.get("name", "pr_velocity"))
         self.max_pr_age_days = stream_config.get("max_pr_age_days")
-        self.search_type_config = stream_config.get("search_type", "ISSUE")
         self.tap = tap
         SearchCountStreamBase.__init__(self, tap=tap, name=self.name, schema=self.get_schema())
 

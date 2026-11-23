@@ -506,7 +506,7 @@ def test_resolve_search_type_advanced_probes_and_caches(monkeypatch):
     assert "type: ISSUE_ADVANCED," in s._graphql_search_count_only("https://api.github.com")
 
 
-def test_resolve_search_type_falls_back_to_issue_with_warning(monkeypatch, caplog):
+def test_resolve_search_type_raises_when_host_lacks_issue_advanced(monkeypatch, caplog):
     s = _mk_stream()
     s.search_type_config = "ISSUE_ADVANCED"
 
@@ -519,12 +519,31 @@ def test_resolve_search_type_falls_back_to_issue_with_warning(monkeypatch, caplo
 
     monkeypatch.setattr(s, "_make_graphql_request", fake_request)
     with caplog.at_level(logging.WARNING):
-        assert s._resolve_search_type("https://api.github.com") == "ISSUE"
+        with pytest.raises(RuntimeError, match="does not offer"):
+            s._resolve_search_type("https://api.github.com")
     assert any("ISSUE_ADVANCED" in r.message for r in caplog.records)
-    assert "type: ISSUE," in s._graphql_search_count_only("https://api.github.com")
 
 
-def test_detect_search_type_handles_null_type(monkeypatch):
+def test_detect_search_type_raises_on_null_data_and_does_not_cache(monkeypatch):
+    s = _mk_stream()
+    calls = []
+
+    def fake_request(query, variables, api_url_base):
+        calls.append(query)
+        resp = Mock()
+        resp.json.return_value = {"data": None}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    with pytest.raises(RuntimeError, match="no usable data"):
+        s._detect_search_type("https://api.github.com")
+    assert "https://api.github.com" not in s._search_type_cache
+    with pytest.raises(RuntimeError, match="no usable data"):
+        s._detect_search_type("https://api.github.com")
+    assert len(calls) == 2
+
+
+def test_detect_search_type_raises_on_null_type_node(monkeypatch):
     s = _mk_stream()
 
     def fake_request(query, variables, api_url_base):
@@ -533,13 +552,36 @@ def test_detect_search_type_handles_null_type(monkeypatch):
         return resp
 
     monkeypatch.setattr(s, "_make_graphql_request", fake_request)
-    assert s._detect_search_type("https://api.github.com") == "ISSUE"
+    with pytest.raises(RuntimeError, match="no usable data"):
+        s._detect_search_type("https://api.github.com")
+
+
+def test_detect_search_type_logs_fallback_warning_once_per_host(monkeypatch, caplog):
+    s = _mk_stream()
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    with caplog.at_level(logging.WARNING):
+        assert s._detect_search_type("https://api.github.com") == "ISSUE"
+        assert s._detect_search_type("https://api.github.com") == "ISSUE"
+    warnings = [r for r in caplog.records if "ISSUE_ADVANCED" in r.message]
+    assert len(warnings) == 1
 
 
 def test_validate_stream_config_rejects_bad_search_type():
     bad = {"name": "bugs", "query_template": "org:{org} type:issue created:{start}..{end}", "search_type": "ADVANCED"}
-    errs = validate_stream_config(bad)
-    assert any("search_type" in e for e in errs)
+    with pytest.raises(ValueError, match="Invalid search_type"):
+        validate_stream_config(bad)
+
+
+def test_validate_stream_config_rejects_pr_velocity_search_type():
+    bad = {"name": "velocity", "mode": "pr_velocity", "query_template": "org:{org} type:pr created:{start}..{end}", "search_type": "ISSUE"}
+    with pytest.raises(ValueError, match="not supported for mode=pr_velocity"):
+        validate_stream_config(bad)
 
 
 def test_validate_stream_config_accepts_advanced():
@@ -578,6 +620,56 @@ def test_batch_fallback_catches_singer_sdk_errors(monkeypatch):
         return 5
 
     monkeypatch.setattr(s, "_search_aggregate_count_batch", raise_retriable)
+    monkeypatch.setattr(s, "_search_aggregate_count", fake_count)
+    counts = s._get_repo_counts_via_batching(["a", "b"], "Automattic", "type:issue", "https://api.github.com")
+    assert counts == {"a": 5, "b": 5}
+
+
+def test_create_configurable_streams_passes_search_type_through():
+    cfg = {
+        "search": {
+            "streams": [
+                {
+                    "name": "bugs",
+                    "query_template": "org:{org} type:issue created:{start}..{end}",
+                    "search_type": "ISSUE_ADVANCED",
+                }
+            ],
+            "scope": {"api_url_base": "https://api.github.com", "orgs": ["Automattic"], "breakdown": "none"},
+            "backfill": {"start_month": "2025-01", "end_month": "2025-01"},
+        }
+    }
+    tap = TapGitHubSearch(config=cfg)
+    streams = create_configurable_streams(tap, cfg)
+    assert len(streams) == 1
+    assert streams[0].search_type_config == "ISSUE_ADVANCED"
+
+
+def test_nodes_path_sends_configured_search_type(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE_ADVANCED"
+
+    def fake_request(query, variables, api_url_base):
+        resp = Mock()
+        resp.json.return_value = {"data": {"__type": {"enumValues": [{"name": "ISSUE"}, {"name": "ISSUE_ADVANCED"}]}}}
+        return resp
+
+    monkeypatch.setattr(s, "_make_graphql_request", fake_request)
+    query = s._graphql_search_with_repos("https://api.github.com")
+    assert "type: ISSUE_ADVANCED" in query
+
+
+def test_batch_fallback_catches_fatal_api_error(monkeypatch):
+    s = _mk_stream()
+    s.search_type_config = "ISSUE"
+
+    def raise_fatal(queries, api_url_base):
+        raise FatalAPIError("boom")
+
+    def fake_count(query, api_url_base):
+        return 5
+
+    monkeypatch.setattr(s, "_search_aggregate_count_batch", raise_fatal)
     monkeypatch.setattr(s, "_search_aggregate_count", fake_count)
     counts = s._get_repo_counts_via_batching(["a", "b"], "Automattic", "type:issue", "https://api.github.com")
     assert counts == {"a": 5, "b": 5}

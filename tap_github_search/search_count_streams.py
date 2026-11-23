@@ -136,11 +136,24 @@ class SearchCountStreamBase(GitHubGraphqlStream):
         if cached:
             return cached
         response = self._make_graphql_request(self._SEARCH_TYPE_PROBE, {}, api_url_base)
-        enum_values = (((response.json().get("data") or {}).get("__type") or {}).get("enumValues") or [])
+        payload = response.json() or {}
+        data = payload.get("data")
+        type_node = (data or {}).get("__type")
+        if data is None or type_node is None:
+            raise RuntimeError(f"Search type probe for {api_url_base} returned no usable data")
+        enum_values = type_node.get("enumValues") or []
         names = {v.get("name") for v in enum_values}
         detected = "ISSUE_ADVANCED" if "ISSUE_ADVANCED" in names else "ISSUE"
         self._search_type_cache[api_url_base] = detected
-        self.logger.info(f"Search type for {api_url_base}: {detected}")
+        if detected == "ISSUE":
+            self.logger.warning(
+                "Host %s does not offer ISSUE_ADVANCED; streams configured with "
+                "search_type=ISSUE_ADVANCED will fail (plain ISSUE cannot count "
+                "advanced syntax on this host)",
+                api_url_base,
+            )
+        else:
+            self.logger.info(f"Search type for {api_url_base}: {detected}")
         return detected
 
     def _resolve_search_type(self, api_url_base: str) -> str:
@@ -148,20 +161,19 @@ class SearchCountStreamBase(GitHubGraphqlStream):
 
         Streams default to plain ISSUE and never probe the host. Only streams
         configured with search_type=ISSUE_ADVANCED probe the SearchType enum,
-        and only on hosts that still offer the (deprecated) advanced type.
-        When the host has removed ISSUE_ADVANCED, fall back to ISSUE with a
-        warning: GitHub handles advanced search syntax through plain ISSUE after
-        removal.
+        configured with search_type=ISSUE_ADVANCED probe the SearchType enum.
+        If the host does not offer ISSUE_ADVANCED, raise: plain ISSUE silently
+        drops advanced qualifiers (e.g. type:Bug) and returns wrong zeros.
         """
         configured = getattr(self, "search_type_config", None) or "ISSUE"
         if configured != "ISSUE_ADVANCED":
             return "ISSUE"
         detected = self._detect_search_type(api_url_base)
-        if detected == "ISSUE":
-            self.logger.warning(
-                "Stream %s configured ISSUE_ADVANCED but %s no longer offers it; "
-                "falling back to ISSUE (advanced syntax is handled by plain ISSUE on this host)",
-                getattr(self, "name", "unknown"), api_url_base,
+        if detected != "ISSUE_ADVANCED":
+            raise RuntimeError(
+                f"Stream {getattr(self, 'name', 'unknown')!r} configured ISSUE_ADVANCED "
+                f"but {api_url_base} does not offer it; plain ISSUE would drop advanced "
+                f"qualifiers and return wrong counts"
             )
         return detected
 
@@ -538,6 +550,13 @@ class ConfigurableSearchCountStream(SearchCountStreamBase):
 
 
 def validate_stream_config(stream_config: dict) -> list[str]:
+    """Validate a stream config. Raises ValueError for unsupported search_type."""
+    search_type = stream_config.get("search_type")
+    if stream_config.get("mode") == "pr_velocity" and search_type is not None:
+        raise ValueError(f"search_type is not supported for mode=pr_velocity streams (got '{search_type}')")
+    if search_type is not None and search_type not in ("ISSUE", "ISSUE_ADVANCED"):
+        raise ValueError(f"Invalid search_type '{search_type}' for stream '{stream_config.get('name', 'unknown')}': must be ISSUE or ISSUE_ADVANCED")
+
     errors = []
     required_fields = ["name", "query_template"]
     for field in required_fields:
@@ -546,9 +565,6 @@ def validate_stream_config(stream_config: dict) -> list[str]:
     name = stream_config.get("name", "")
     if name and not name.replace("_", "").replace("-", "").isalnum():
         errors.append(f"Stream name '{name}' must contain only alphanumeric characters, underscores, and hyphens")
-    search_type = stream_config.get("search_type")
-    if search_type is not None and search_type not in ("ISSUE", "ISSUE_ADVANCED"):
-        errors.append(f"search_type must be one of: ISSUE, ISSUE_ADVANCED (got '{search_type}')")
     query_template = stream_config.get("query_template", "")
     for placeholder in ["{org}", "{start}", "{end}"]:
         if placeholder not in query_template:
@@ -563,6 +579,8 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
     if "search" in config:
         s = config.get("search", {})
         for sd in s.get("streams", []):
+            raw_search_type = sd.get("search_type")
+            normalized_search_type = str(raw_search_type).strip().upper() if raw_search_type is not None else None
             sc = {
                 "name": sd.get("name"),
                 "query_template": sd.get("query_template"),
@@ -571,12 +589,13 @@ def create_configurable_streams(tap, config_override: dict | None = None) -> lis
                 "markers": sd.get("markers", []),
                 "reviewer_clause": sd.get("reviewer_clause", ""),
                 "max_pr_age_days": sd.get("max_pr_age_days"),
-                "search_type": sd.get("search_type", "ISSUE"),
+                "search_type": normalized_search_type,
             }
             errors = validate_stream_config(sc)
             if errors:
                 tap.logger.warning(f"Invalid stream config '{sc.get('name', 'unknown')}': {'; '.join(errors)}")
                 continue
+            sc["search_type"] = normalized_search_type or "ISSUE"
             if sd.get("mode") == "pr_velocity":
                 from tap_github_search.pr_velocity_stream import ConfigurablePrVelocityStream
 
